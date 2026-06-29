@@ -12,3 +12,6 @@ custom-multi-agent-skill/tasks/
 .idea/
 *.pyc
 __pycache__/
+
+# Local duplicate development folder
+custom-multi-agent-skill/
