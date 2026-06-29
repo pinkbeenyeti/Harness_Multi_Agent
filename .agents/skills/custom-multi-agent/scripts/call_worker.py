@@ -1,6 +1,13 @@
 import os
 import sys
 import json
+
+# Windows cp949 인코딩 크래시 방지
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 import urllib.request
 import urllib.error
 import time
