@@ -1,0 +1,14 @@
+# API Keys (보안 정보)
+api_keys.json
+
+# Local multi-agent runtime data
+custom-multi-agent-skill/vault/
+custom-multi-agent-skill/tasks/
+.agents/skills/custom-multi-agent/vault/
+.agents/skills/custom-multi-agent/tasks/
+
+# IDE and Python environments
+.venv/
+.idea/
+*.pyc
+__pycache__/
