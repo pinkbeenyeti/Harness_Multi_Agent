@@ -204,6 +204,27 @@ async def call_antigravity_sdk(prompt):
         output_tokens = len(content) // 4
         return content, input_tokens, output_tokens
 
+def update_task_status(task_dir, new_status):
+    task_md_path = os.path.join(task_dir, "task.md")
+    if not os.path.exists(task_md_path):
+        return
+    try:
+        with open(task_md_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        for i, line in enumerate(lines):
+            if line.strip().startswith("* **Status**:"):
+                comment = ""
+                if "#" in line:
+                    comment = "  #" + line.split("#", 1)[1].rstrip()
+                lines[i] = f"* **Status**: {new_status}{comment}\n"
+                break
+                
+        with open(task_md_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        print(f"[Warning] Failed to update task.md status: {e}")
+
 class FileLock:
     def __init__(self, lock_file_path, timeout=10.0):
         self.lock_file_path = lock_file_path
@@ -309,6 +330,17 @@ def main():
         with open(brief_path, "r", encoding="utf-8") as f:
             prompt = f.read()
             
+        # 상태 업데이트 및 로그 기록 (진행 중)
+        status_msg = f"waiting_{role} ({model} is executing...)"
+        update_task_status(task_dir, status_msg)
+        
+        log_path = os.path.join(task_dir, "log.md")
+        if os.path.exists(log_path):
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+            with open(log_path, "a", encoding="utf-8") as lf:
+                lf.write(f"\n{current_time} [WORKER_START] '{role}' ({model}) 호출 개시. (워커가 지시를 수행하고 결과를 작성 중...)")
+                
+        print(f"\n⚙️ [{model}] Worker '{role}'이(가) 지시를 수행하며 코드를 작성 중입니다...")
         print(f"[API Call] Running worker '{role}' via {provider} ({model})...")
         
         # 3. provider별 API 호출 (에러 캐치 루프 포함)
@@ -332,6 +364,9 @@ def main():
             error_msg = str(e)
             print(f"[API ERROR] {error_msg}")
             
+            # 에러 상태 업데이트
+            update_task_status(task_dir, f"error (Worker '{role}' failed)")
+            
             # log.md에 상세 에러 내용 적재
             log_path = os.path.join(task_dir, "log.md")
             if os.path.exists(log_path):
@@ -350,6 +385,9 @@ def main():
         with open(result_path, "w", encoding="utf-8") as f:
             f.write(result_text)
             
+        # 리뷰 진행 중으로 상태 업데이트
+        update_task_status(task_dir, "reviewing (Orchestrator is verifying the output...)")
+        
         print(f"[API Success] Worker response written to '{result_path}'")
         print(f"[Cost Report] Tokens used: {input_tokens} input, {output_tokens} output. Cost for this call: ${call_cost:.5f}")
         
