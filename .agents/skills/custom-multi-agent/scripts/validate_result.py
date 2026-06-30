@@ -83,6 +83,48 @@ def validate_file(task_name, file_path):
         else:
             print(f"[PASS] English word count within limit ({english_cnt}/{limit_english})")
             
+    elif filename.endswith(".py"):
+        import ast
+        try:
+            ast.parse(content)
+            print("[PASS] Python syntax validation check passed!")
+        except SyntaxError as e:
+            print(f"[FAIL] Python syntax validation check failed!")
+            print(f"       - File: {filename}")
+            print(f"       - Line: {e.lineno}")
+            print(f"       - Offset: {e.offset}")
+            print(f"       - Error: {e.msg}")
+            print(f"       - Code: {e.text.strip() if e.text else ''}")
+            is_valid = False
+            
+    elif filename.endswith(".json"):
+        import json
+        try:
+            json.loads(content)
+            print("[PASS] JSON syntax validation check passed!")
+        except json.JSONDecodeError as e:
+            print(f"[FAIL] JSON syntax validation check failed!")
+            print(f"       - File: {filename}")
+            print(f"       - Line: {e.lineno}")
+            print(f"       - Col: {e.colno}")
+            print(f"       - Error: {e.msg}")
+            is_valid = False
+            
+    elif filename.endswith(".js"):
+        import subprocess
+        try:
+            # node -c performs a syntax check without running the script
+            result = subprocess.run(["node", "-c", file_path], capture_output=True, text=True, check=True)
+            print("[PASS] JavaScript syntax validation check passed (via node -c)!")
+        except FileNotFoundError:
+            # Node.js is not installed, skip or do a basic pass
+            print("[INFO] Node.js not found. Skipping deep JavaScript syntax validation.")
+        except subprocess.CalledProcessError as e:
+            print(f"[FAIL] JavaScript syntax validation check failed!")
+            print(f"       - File: {filename}")
+            print(f"       - Error: {e.stderr.strip()}")
+            is_valid = False
+
     if is_valid:
         print("[PASS] Verification checklist rules satisfied!")
         sys.exit(0)

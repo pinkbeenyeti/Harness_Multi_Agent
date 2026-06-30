@@ -211,7 +211,23 @@ async def call_antigravity_sdk(prompt):
         output_tokens = len(content) // 4
         return content, input_tokens, output_tokens
 
+def safe_run_async(coro):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+        
+    if loop and loop.is_running():
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(asyncio.run, coro)
+            return future.result()
+    else:
+        return asyncio.run(coro)
+
 def update_task_status(task_dir, new_status):
+    import re
     task_md_path = os.path.join(task_dir, "task.md")
     if not os.path.exists(task_md_path):
         return
@@ -219,12 +235,18 @@ def update_task_status(task_dir, new_status):
         with open(task_md_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
         
+        # 띄어쓰기, 대소문자, 볼드 마크 및 불릿 형태에 구애받지 않고 Status 행 매칭
+        pattern = re.compile(r'^(\s*[\-\*]\s*(?:\*\*)?status(?:\*\*)?\s*:\s*)(.*)$', re.IGNORECASE)
+        
         for i, line in enumerate(lines):
-            if line.strip().startswith("* **Status**:"):
+            match = pattern.match(line)
+            if match:
+                prefix = match.group(1)  # 기존 리스트 불릿 및 볼드 형식 보존
+                remaining = match.group(2)
                 comment = ""
-                if "#" in line:
-                    comment = "  #" + line.split("#", 1)[1].rstrip()
-                lines[i] = f"* **Status**: {new_status}{comment}\n"
+                if "#" in remaining:
+                    comment = "  #" + remaining.split("#", 1)[1].rstrip()
+                lines[i] = f"{prefix}{new_status}{comment}\n"
                 break
                 
         with open(task_md_path, "w", encoding="utf-8") as f:
@@ -233,15 +255,35 @@ def update_task_status(task_dir, new_status):
         print(f"[Warning] Failed to update task.md status: {e}")
 
 class FileLock:
-    def __init__(self, lock_file_path, timeout=10.0):
+    def __init__(self, lock_file_path, timeout=35.0, stale_limit=30.0):
         self.lock_file_path = lock_file_path
         self.timeout = timeout
+        self.stale_limit = stale_limit
         self.is_locked = False
    
     def __enter__(self):
+        if os.path.exists(self.lock_file_path):
+            try:
+                mtime = os.path.getmtime(self.lock_file_path)
+                if time.time() - mtime > self.stale_limit:
+                    print(f"[Lock] Stale lock detected before loop (aged {time.time() - mtime:.1f}s). Removing stale lock file.")
+                    os.remove(self.lock_file_path)
+            except OSError:
+                pass
+
         start_time = time.time()
         while time.time() - start_time < self.timeout:
             try:
+                # 30초 이상 경과된 Stale Lock 가로채기 및 제거
+                if os.path.exists(self.lock_file_path):
+                    try:
+                        mtime = os.path.getmtime(self.lock_file_path)
+                        if time.time() - mtime > self.stale_limit:
+                            print(f"[Lock] Stale lock detected inside loop (aged {time.time() - mtime:.1f}s). Removing stale lock file.")
+                            os.remove(self.lock_file_path)
+                    except OSError:
+                        pass
+                
                 fd = os.open(self.lock_file_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.close(fd)
                 self.is_locked = True
@@ -293,132 +335,146 @@ def main():
                     worker_mode = cost_data.get("worker_mode", "multi-api")
             except Exception as e:
                 print(f"[Warning] Failed to load cost_tracker.json: {e}")
-                
-        # 1. config 로드 및 worker_mode 가공
-        if worker_mode == "antigravity":
-            provider = "antigravity"
-            model = "agy-agent"
-            worker_cfg = {"input_price_per_1m": 0.0, "output_price_per_1m": 0.0}
-            print("[Mode: Antigravity] Running via local Antigravity Python SDK (free quota).")
-        else:
-            if worker_mode == "gemini-only":
-                print(f"[Mode: Gemini-Only] Overriding worker role '{role}' to force use 'gemini'.")
-                role = "gemini"
+
+    # 1. config 로드 및 worker_mode 가공
+    if worker_mode == "antigravity":
+        provider = "antigravity"
+        model = "agy-agent"
+        worker_cfg = {"input_price_per_1m": 0.0, "output_price_per_1m": 0.0}
+        print("[Mode: Antigravity] Running via local Antigravity Python SDK (free quota).")
+    else:
+        if worker_mode == "gemini-only":
+            print(f"[Mode: Gemini-Only] Overriding worker role '{role}' to force use 'gemini'.")
+            role = "gemini"
+        worker_cfg = load_backend_config(role)
+        provider = worker_cfg["provider"]
+        model = worker_cfg["model"]
+    
+    # 1.1 예산 초과 검사 및 자동 Fallback 처리
+    if worker_mode != "antigravity" and accumulated_cost >= budget_limit:
+        if role != fallback_role:
+            print(f"[BUDGET EXCEEDED] Current accumulated cost (${accumulated_cost:.5f}) has exceeded budget limit (${budget_limit:.2f}).")
+            print(f"[BUDGET EXCEEDED] Automatically switching worker role from '{role}' to fallback role '{fallback_role}'.")
+            
+            # log.md에 스위칭 결정 기록
+            log_path = os.path.join(task_dir, "log.md")
+            if os.path.exists(log_path):
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+                with open(log_path, "a", encoding="utf-8") as lf:
+                    lf.write(f"\n{current_time} [DECISION] API 예산 한도(${budget_limit:.2f}) 초과(현재: ${accumulated_cost:.4f}). 워커 '{role}'에서 폴백 워커 '{fallback_role}'로 자동 전환하여 호출합니다.")
+            
+            role = fallback_role
             worker_cfg = load_backend_config(role)
             provider = worker_cfg["provider"]
             model = worker_cfg["model"]
+        else:
+            print(f"[BUDGET ERROR] Budget limit (${budget_limit:.2f}) exceeded and already using fallback role '{fallback_role}'. Terminating.")
+            sys.exit(2)
+    
+    # 2. brief(지시서) 읽기
+    if not os.path.exists(brief_path):
+        print(f"Error: Brief file not found at '{brief_path}'")
+        sys.exit(1)
         
-        # 1.1 예산 초과 검사 및 자동 Fallback 처리
-        if worker_mode != "antigravity" and accumulated_cost >= budget_limit:
-            if role != fallback_role:
-                print(f"[BUDGET EXCEEDED] Current accumulated cost (${accumulated_cost:.5f}) has exceeded budget limit (${budget_limit:.2f}).")
-                print(f"[BUDGET EXCEEDED] Automatically switching worker role from '{role}' to fallback role '{fallback_role}'.")
-                
-                # log.md에 스위칭 결정 기록
-                log_path = os.path.join(task_dir, "log.md")
-                if os.path.exists(log_path):
-                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    with open(log_path, "a", encoding="utf-8") as lf:
-                        lf.write(f"\n{current_time} [DECISION] API 예산 한도(${budget_limit:.2f}) 초과(현재: ${accumulated_cost:.4f}). 워커 '{role}'에서 폴백 워커 '{fallback_role}'로 자동 전환하여 호출합니다.")
-                
-                role = fallback_role
-                worker_cfg = load_backend_config(role)
-                provider = worker_cfg["provider"]
-                model = worker_cfg["model"]
-            else:
-                print(f"[BUDGET ERROR] Budget limit (${budget_limit:.2f}) exceeded and already using fallback role '{fallback_role}'. Terminating.")
-                sys.exit(2)
+    with open(brief_path, "r", encoding="utf-8") as f:
+        prompt = f.read()
         
-        # 2. brief(지시서) 읽기
-        if not os.path.exists(brief_path):
-            print(f"Error: Brief file not found at '{brief_path}'")
+    # 상태 업데이트 및 로그 기록 (진행 중)
+    status_msg = f"waiting_{role} ({model} is executing...)"
+    update_task_status(task_dir, status_msg)
+    
+    log_path = os.path.join(task_dir, "log.md")
+    if os.path.exists(log_path):
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write(f"\n{current_time} [WORKER_START] '{role}' ({model}) 호출 개시. (워커가 지시를 수행하고 결과를 작성 중...)")
+            
+    print(f"\n⚙️ [{model}] Worker '{role}'이(가) 지시를 수행하며 코드를 작성 중입니다...")
+    print(f"[API Call] Running worker '{role}' via {provider} ({model})...")
+    
+    # 3. provider별 API 호출 (에러 캐치 루프 포함)
+    result_text = ""
+    input_tokens = 0
+    output_tokens = 0
+    
+    try:
+        if provider == "anthropic":
+            result_text, input_tokens, output_tokens = call_anthropic(model, prompt)
+        elif provider == "openai":
+            result_text, input_tokens, output_tokens = call_openai(model, prompt)
+        elif provider == "google":
+            result_text, input_tokens, output_tokens = call_google(model, prompt)
+        elif provider == "antigravity":
+            result_text, input_tokens, output_tokens = safe_run_async(call_antigravity_sdk(prompt))
+        else:
+            print(f"Error: Unsupported provider '{provider}'")
             sys.exit(1)
-            
-        with open(brief_path, "r", encoding="utf-8") as f:
-            prompt = f.read()
-            
-        # 상태 업데이트 및 로그 기록 (진행 중)
-        status_msg = f"waiting_{role} ({model} is executing...)"
-        update_task_status(task_dir, status_msg)
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[API ERROR] {error_msg}")
         
+        # 에러 상태 업데이트
+        update_task_status(task_dir, f"error (Worker '{role}' failed)")
+        
+        # log.md에 상세 에러 내용 적재
         log_path = os.path.join(task_dir, "log.md")
         if os.path.exists(log_path):
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
             with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write(f"\n{current_time} [WORKER_START] '{role}' ({model}) 호출 개시. (워커가 지시를 수행하고 결과를 작성 중...)")
-                
-        print(f"\n⚙️ [{model}] Worker '{role}'이(가) 지시를 수행하며 코드를 작성 중입니다...")
-        print(f"[API Call] Running worker '{role}' via {provider} ({model})...")
+                lf.write(f"\n{current_time} [ERROR] '{role}' ({model}) API 호출 실패. 원인: {error_msg}")
+        sys.exit(1)
         
-        # 3. provider별 API 호출 (에러 캐치 루프 포함)
-        result_text = ""
-        input_tokens = 0
-        output_tokens = 0
+    # 3.1 비용 계산 및 누적 업데이트
+    input_price = worker_cfg.get("input_price_per_1m", 0.0)
+    output_price = worker_cfg.get("output_price_per_1m", 0.0)
+    call_cost = (input_tokens * input_price / 1000000.0) + (output_tokens * output_price / 1000000.0)
+    
+    # 4. 결과 작성 및 트래커 업데이트
+    with open(result_path, "w", encoding="utf-8") as f:
+        f.write(result_text)
+        
+    # 리뷰 진행 중으로 상태 업데이트
+    update_task_status(task_dir, "reviewing (Orchestrator is verifying the output...)")
+    
+    print(f"[API Success] Worker response written to '{result_path}'")
+    print(f"[Cost Report] Tokens used: {input_tokens} input, {output_tokens} output. Cost for this call: ${call_cost:.5f}")
+    
+    with FileLock(lock_path):
+        cost_data = {}
+        if os.path.exists(cost_tracker_path):
+            try:
+                with open(cost_tracker_path, "r", encoding="utf-8") as f:
+                    cost_data = json.load(f)
+            except Exception as e:
+                print(f"[Warning] Failed to reload cost_tracker.json: {e}")
+                
+        # update accumulated_cost and history
+        current_accumulated_cost = cost_data.get("accumulated_cost", 0.0)
+        new_accumulated_cost = current_accumulated_cost + call_cost
+        cost_data["accumulated_cost"] = round(new_accumulated_cost, 6)
+        if "history" not in cost_data:
+            cost_data["history"] = []
+        cost_data["history"].append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "role": role,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost": round(call_cost, 6)
+        })
         
         try:
-            if provider == "anthropic":
-                result_text, input_tokens, output_tokens = call_anthropic(model, prompt)
-            elif provider == "openai":
-                result_text, input_tokens, output_tokens = call_openai(model, prompt)
-            elif provider == "google":
-                result_text, input_tokens, output_tokens = call_google(model, prompt)
-            elif provider == "antigravity":
-                result_text, input_tokens, output_tokens = asyncio.run(call_antigravity_sdk(prompt))
-            else:
-                print(f"Error: Unsupported provider '{provider}'")
-                sys.exit(1)
-        except Exception as e:
-            error_msg = str(e)
-            print(f"[API ERROR] {error_msg}")
-            
-            # 에러 상태 업데이트
-            update_task_status(task_dir, f"error (Worker '{role}' failed)")
-            
-            # log.md에 상세 에러 내용 적재
-            log_path = os.path.join(task_dir, "log.md")
-            if os.path.exists(log_path):
-                current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-                with open(log_path, "a", encoding="utf-8") as lf:
-                    lf.write(f"\n{current_time} [ERROR] '{role}' ({model}) API 호출 실패. 원인: {error_msg}")
-            sys.exit(1)
-            
-        # 3.1 비용 계산 및 누적 업데이트
-        input_price = worker_cfg.get("input_price_per_1m", 0.0)
-        output_price = worker_cfg.get("output_price_per_1m", 0.0)
-        call_cost = (input_tokens * input_price / 1000000.0) + (output_tokens * output_price / 1000000.0)
-        new_accumulated_cost = accumulated_cost + call_cost
-        
-        # 4. 결과 작성 및 트래커 업데이트
-        with open(result_path, "w", encoding="utf-8") as f:
-            f.write(result_text)
-            
-        # 리뷰 진행 중으로 상태 업데이트
-        update_task_status(task_dir, "reviewing (Orchestrator is verifying the output...)")
-        
-        print(f"[API Success] Worker response written to '{result_path}'")
-        print(f"[Cost Report] Tokens used: {input_tokens} input, {output_tokens} output. Cost for this call: ${call_cost:.5f}")
-        
-        if os.path.exists(cost_tracker_path):
-            cost_data["accumulated_cost"] = round(new_accumulated_cost, 6)
-            if "history" not in cost_data:
-                cost_data["history"] = []
-            cost_data["history"].append({
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "role": role,
-                "model": model,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cost": round(call_cost, 6)
-            })
             with open(cost_tracker_path, "w", encoding="utf-8") as f:
                 json.dump(cost_data, f, indent=2, ensure_ascii=False)
-                
-            # log.md에 비용 및 워커 성공 기록
-            log_path = os.path.join(task_dir, "log.md")
-            if os.path.exists(log_path):
-                current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-                with open(log_path, "a", encoding="utf-8") as lf:
-                    lf.write(f"\n{current_time} [WORKER_CALL] '{role}' ({model}) 호출 완료. 소모 비용: ${call_cost:.5f} (누적: ${new_accumulated_cost:.5f}/{budget_limit:.2f})")
+        except Exception as e:
+            print(f"[Warning] Failed to save cost_tracker.json: {e}")
+            
+        # log.md에 비용 및 워커 성공 기록
+        log_path = os.path.join(task_dir, "log.md")
+        if os.path.exists(log_path):
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+            with open(log_path, "a", encoding="utf-8") as lf:
+                lf.write(f"\n{current_time} [WORKER_CALL] '{role}' ({model}) 호출 완료. 소모 비용: ${call_cost:.5f} (누적: ${new_accumulated_cost:.5f}/{budget_limit:.2f})")
 
 if __name__ == "__main__":
     main()

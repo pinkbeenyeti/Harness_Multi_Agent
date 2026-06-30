@@ -205,11 +205,43 @@ def update_wiki_index(wiki_path):
         # 위키 내부 위키링크[[문서명]] 포맷 지원
         links.append(f"- [[{f.stem}]]")
         
-    index_content = "# Knowledge Base Index\n\n지식 그물(Knot)에 등록된 위키 문서 목록입니다.\n\n"
-    index_content += "\n".join(sorted(links))
+    links_str = "\n".join(sorted(links))
     
+    start_marker = "<!-- KNOT_INDEX_START -->"
+    end_marker = "<!-- KNOT_INDEX_END -->"
+    
+    has_existing_index = index_file.exists()
+    existing_content = ""
+    
+    if has_existing_index:
+        try:
+            with open(index_file, "r", encoding="utf-8") as f:
+                existing_content = f.read()
+        except Exception as e:
+            print(f"[Warning] Failed to read existing index.md: {e}")
+            has_existing_index = False
+            
+    if has_existing_index and start_marker in existing_content and end_marker in existing_content:
+        # 마커 사이의 내용만 부분 교체 (DOTALL로 멀티라인 매칭)
+        pattern = re.escape(start_marker) + r"(.*?)" + re.escape(end_marker)
+        replacement = f"{start_marker}\n{links_str}\n{end_marker}"
+        new_content = re.sub(pattern, replacement, existing_content, flags=re.DOTALL)
+        print(f"[INDEX] Preserved custom index structure. Updating link section inside markers.")
+    elif has_existing_index:
+        # 기존 파일이 존재하지만 마커가 없는 경우 (overwrite/erase 방지)
+        # 파일 끝에 마커와 링크 리스트를 추가
+        base_content = existing_content
+        if not base_content.endswith("\n"):
+            base_content += "\n"
+        new_content = f"{base_content}\n{start_marker}\n{links_str}\n{end_marker}\n"
+        print(f"[INDEX] Appending index markers and links to the existing index.md file.")
+    else:
+        # 기존 파일이 없거나 마커가 없는 경우 전체 생성 (마커 포함)
+        new_content = f"# Knowledge Base Index\n\n지식 그물(Knot)에 등록된 위키 문서 목록입니다.\n\n{start_marker}\n{links_str}\n{end_marker}\n"
+        print(f"[INDEX] Creating/re-generating index file with markdown markers.")
+        
     with open(index_file, "w", encoding="utf-8") as f:
-        f.write(index_content)
+        f.write(new_content)
     print(f"[INDEX] Automatically updated central index: {index_file}")
 
 # 3. LINT: 끊어진 링크([[Broken Link]])를 탐색하는 검사기
