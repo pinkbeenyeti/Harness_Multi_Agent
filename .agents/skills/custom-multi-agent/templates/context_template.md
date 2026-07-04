@@ -11,3 +11,9 @@
 
 ## Key Blockers / Pending Questions
 * [현재 해결해야 하는 기술적 난제나 유저의 의사결정이 대기 중인 사항]
+
+---
+
+<!-- worker_booster: _shared/worker_booster.md 내용이 브리프 생성 시 여기에 자동 삽입됩니다 -->
+
+{{WORKER_BOOSTER}}
