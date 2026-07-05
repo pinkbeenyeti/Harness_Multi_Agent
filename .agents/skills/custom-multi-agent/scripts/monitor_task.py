@@ -57,10 +57,17 @@ def parse_task_md(task_md_path):
         with open(task_md_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
             
+        pattern = re.compile(r'^\s*[\-\*]\s*(?:\*\*)?status(?:\*\*)?\s*:\s*(.*)$', re.IGNORECASE)
         for line in lines:
-            line_str = line.strip()
-            if line_str.startswith("* **Status**:"):
-                status = line_str.replace("* **Status**:", "").strip()
+            match = pattern.match(line)
+            if match:
+                raw_status = match.group(1).strip()
+                # 뒤쪽에 붙은 주석(# ...) 제외 처리
+                if "#" in raw_status:
+                    status = raw_status.split("#", 1)[0].strip()
+                else:
+                    status = raw_status
+                break
         
         in_goal = False
         goal_lines = []

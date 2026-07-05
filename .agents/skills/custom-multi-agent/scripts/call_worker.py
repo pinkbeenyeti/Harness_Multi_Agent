@@ -1,5 +1,6 @@
 import os
 import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import json
 
 # Windows cp949 인코딩 크래시 방지

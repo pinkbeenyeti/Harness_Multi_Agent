@@ -5,7 +5,7 @@ import json
 
 def count_korean_characters(text):
     # 한글 글자만 필터링하여 카운트
-    korean_chars = re.findall(r'[ㄱ-ㅎ|ㅏ-ㅣ|가-힣]', text)
+    korean_chars = re.findall(r'[ㄱ-ㅎㅏ-ㅣ가-힣]', text)
     return len(korean_chars)
 
 def count_english_words(text):
@@ -110,8 +110,8 @@ def validate_file(task_name, file_path):
     elif filename.endswith(".js"):
         import subprocess
         try:
-            result = subprocess.run(["node", "-c", file_path], capture_output=True, text=True, check=True)
-            print("[PASS] JavaScript syntax validation check passed (via node -c)!")
+            result = subprocess.run(["node", "--check", file_path], capture_output=True, text=True, check=True)
+            print("[PASS] JavaScript syntax validation check passed (via node --check)!")
         except FileNotFoundError:
             print("[INFO] Node.js not found. Skipping deep JavaScript syntax validation.")
         except subprocess.CalledProcessError as e:

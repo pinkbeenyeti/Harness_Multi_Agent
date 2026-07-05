@@ -1,0 +1,7 @@
+{
+  "budget_limit": 2.0,
+  "accumulated_cost": 0.0,
+  "fallback_role": "gemini",
+  "worker_mode": "multi-api",
+  "history": []
+}

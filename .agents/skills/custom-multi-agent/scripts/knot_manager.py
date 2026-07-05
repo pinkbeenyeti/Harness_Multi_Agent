@@ -1,5 +1,6 @@
 import os
 import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shutil
 import re
 import json
@@ -151,27 +152,38 @@ def ingest_documents():
         dest_filename = f.stem + ".md"
         dest_path = wiki / dest_filename
         
-        # 이미 마크다운인 경우 바로 복사, 아닌 경우 텍스트 변환 복사
-        if f.suffix.lower() == ".md":
-            shutil.copy(f, dest_path)
-        else:
-            with open(f, "r", encoding="utf-8", errors="ignore") as src_file:
-                body = src_file.read()
+        success = False
+        try:
+            # 이미 마크다운인 경우 바로 복사, 아닌 경우 텍스트 변환 복사
+            if f.suffix.lower() == ".md":
+                shutil.copy(f, dest_path)
+                success = True
+            else:
+                with open(f, "r", encoding="utf-8", errors="ignore") as src_file:
+                    body = src_file.read()
+                    
+                print(f"[INGEST] Processing '{f.name}' through LLM for summarization and wiki generation...")
+                llm_result = call_llm_for_wiki(body, f.name)
                 
-            print(f"[INGEST] Processing '{f.name}' through LLM for summarization and wiki generation...")
-            llm_result = call_llm_for_wiki(body, f.name)
+                with open(dest_path, "w", encoding="utf-8") as dest_file:
+                    if llm_result:
+                        dest_file.write(llm_result)
+                        print(f"[INGEST] Successfully generated LLM summary for '{f.name}'")
+                    else:
+                        dest_file.write(f"# {f.stem}\n\nConverted from source inbox file (LLM Fallback).\n\n```text\n{body}\n```\n")
+                        print(f"[INGEST] Fallback to raw copy for '{f.name}' (No LLM response)")
+                success = True
+        except Exception as e:
+            print(f"[INGEST ERROR] Failed to process or write '{f.name}': {e}")
+            success = False
             
-            with open(dest_path, "w", encoding="utf-8") as dest_file:
-                if llm_result:
-                    dest_file.write(llm_result)
-                    print(f"[INGEST] Successfully generated LLM summary for '{f.name}'")
-                else:
-                    dest_file.write(f"# {f.stem}\n\nConverted from source inbox file (LLM Fallback).\n\n```text\n{body}\n```\n")
-                    print(f"[INGEST] Fallback to raw copy for '{f.name}' (No LLM response)")
-                
         # 가공 완료 후 inbox 원본 삭제 (또는 아카이빙)
-        os.remove(f)
-        print(f"[INGEST] Converted & compiled '{f.name}' -> 'wiki/{dest_filename}'")
+        if success:
+            try:
+                os.remove(f)
+                print(f"[INGEST] Converted & compiled '{f.name}' -> 'wiki/{dest_filename}'")
+            except Exception as e:
+                print(f"[INGEST ERROR] Failed to remove source file '{f.name}': {e}")
         
     # 인덱스 파일(index.md) 자동 갱신
     update_wiki_index(wiki)

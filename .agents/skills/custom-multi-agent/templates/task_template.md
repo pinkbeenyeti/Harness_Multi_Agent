@@ -24,3 +24,6 @@
   #   approved_at: 승인 시각
   #   purpose: 호출 목적
   #   approved_by: user
+
+## Self-Critique & Tradeoffs
+* [설계 및 구현 시 고려한 대안들과 트레이드오프, 그리고 자가 비평 내용을 작성하십시오.]
