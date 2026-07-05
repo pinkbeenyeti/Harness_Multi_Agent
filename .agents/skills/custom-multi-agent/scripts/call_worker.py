@@ -13,6 +13,7 @@ import urllib.error
 import time
 import asyncio
 from datetime import datetime
+from common_utils import load_api_keys
 
 def load_backend_config(role):
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,30 +33,7 @@ def load_backend_config(role):
         
     return workers[role]
 
-def load_api_keys():
-    # 1. 스크립트 실행 위치 및 오케스트레이터의 작업 폴더(cwd) 기준 여러 경로에서 api_keys.json 로드 시도
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    search_paths = [
-        os.path.join(base_dir, "api_keys.json"),                # 스킬 폴더 내부
-        os.path.join(os.path.dirname(base_dir), "api_keys.json"), # 워크스페이스 루트 폴더
-        os.path.join(os.getcwd(), "api_keys.json")              # 현재 작업 중인 경로
-    ]
-    
-    for p in search_paths:
-        if os.path.exists(p):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    keys = json.load(f)
-                for k, v in keys.items():
-                    # 템플릿용 기본 플레이스홀더 값은 주입하지 않음
-                    if v and not v.startswith("your-") and v != "your_actual_key_here":
-                        os.environ[k] = v
-                print(f"[API Key] Loaded configurations from '{p}'")
-                return
-            except Exception as e:
-                print(f"[Warning] Failed to load keys from '{p}': {e}")
-
-def call_anthropic(model, prompt):
+def call_anthropic(model, prompt, system_prompt=None):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY environment variable or configuration is missing.")
@@ -74,6 +52,8 @@ def call_anthropic(model, prompt):
             {"role": "user", "content": prompt}
         ]
     }
+    if system_prompt:
+        data["system"] = system_prompt
     
     req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
     
@@ -101,7 +81,7 @@ def call_anthropic(model, prompt):
             else:
                 raise RuntimeError(f"Anthropic Connection Error: {e}")
 
-def call_openai(model, prompt):
+def call_openai(model, prompt, system_prompt=None):
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY environment variable or configuration is missing.")
@@ -112,11 +92,14 @@ def call_openai(model, prompt):
         "Content-Type": "application/json"
     }
     
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
     data = {
         "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
+        "messages": messages
     }
     
     req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
@@ -145,7 +128,7 @@ def call_openai(model, prompt):
             else:
                 raise RuntimeError(f"OpenAI Connection Error: {e}")
 
-def call_google(model, prompt):
+def call_google(model, prompt, system_prompt=None):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY environment variable or configuration is missing.")
@@ -160,6 +143,10 @@ def call_google(model, prompt):
             "parts": [{"text": prompt}]
         }]
     }
+    if system_prompt:
+        data["systemInstruction"] = {
+            "parts": [{"text": system_prompt}]
+        }
     
     req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
     
@@ -188,14 +175,15 @@ def call_google(model, prompt):
             else:
                 raise RuntimeError(f"Gemini Connection Error: {e}")
 
-async def call_antigravity_sdk(prompt):
+async def call_antigravity_sdk(prompt, system_prompt=None):
     try:
         from google.antigravity import Agent, LocalAgentConfig, CapabilitiesConfig
     except ImportError:
         raise RuntimeError("Google Antigravity SDK is not installed. Please install it using: pip install google-antigravity")
         
+    sys_inst = system_prompt if system_prompt else "You are a specialized worker agent executing a subtask."
     config = LocalAgentConfig(
-        system_instructions="You are a specialized worker agent executing a subtask.",
+        system_instructions=sys_inst,
         capabilities=CapabilitiesConfig()
     )
     
@@ -310,6 +298,9 @@ def main():
     brief_path = sys.argv[2]
     result_path = sys.argv[3]
     
+    # base_dir 명시적 정의 (NameError 방지)
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
     # 0. API Key 설정 파일 사전 로드
     load_api_keys()
     
@@ -378,7 +369,17 @@ def main():
         
     with open(brief_path, "r", encoding="utf-8") as f:
         prompt = f.read()
-        
+    # worker_booster.md 로드 (system_prompt 용)
+    worker_booster_path = os.path.join(base_dir, "_shared", "worker_booster.md")
+    system_prompt = None
+    if os.path.exists(worker_booster_path):
+        try:
+            with open(worker_booster_path, "r", encoding="utf-8") as f:
+                system_prompt = f.read()
+            print(f"[System Prompt] Loaded worker booster config from '{worker_booster_path}'")
+        except Exception as e:
+            print(f"[Warning] Failed to load worker booster from '{worker_booster_path}': {e}")
+
     # 상태 업데이트 및 로그 기록 (진행 중)
     status_msg = f"waiting_{role} ({model} is executing...)"
     update_task_status(task_dir, status_msg)
@@ -399,13 +400,13 @@ def main():
     
     try:
         if provider == "anthropic":
-            result_text, input_tokens, output_tokens = call_anthropic(model, prompt)
+            result_text, input_tokens, output_tokens = call_anthropic(model, prompt, system_prompt)
         elif provider == "openai":
-            result_text, input_tokens, output_tokens = call_openai(model, prompt)
+            result_text, input_tokens, output_tokens = call_openai(model, prompt, system_prompt)
         elif provider == "google":
-            result_text, input_tokens, output_tokens = call_google(model, prompt)
+            result_text, input_tokens, output_tokens = call_google(model, prompt, system_prompt)
         elif provider == "antigravity":
-            result_text, input_tokens, output_tokens = safe_run_async(call_antigravity_sdk(prompt))
+            result_text, input_tokens, output_tokens = safe_run_async(call_antigravity_sdk(prompt, system_prompt))
         else:
             print(f"Error: Unsupported provider '{provider}'")
             sys.exit(1)
@@ -440,21 +441,31 @@ def main():
     print(f"[Cost Report] Tokens used: {input_tokens} input, {output_tokens} output. Cost for this call: ${call_cost:.5f}")
     
     with FileLock(lock_path):
-        cost_data = {}
+        # 최신 상태를 파일에서 다시 읽되, 파일이 없으면 기존 메모리에 있는 상태를 사용하도록 함.
+        # 또한 budget_limit, fallback_role, worker_mode가 누락되지 않도록 보장
+        current_data = {
+            "budget_limit": budget_limit,
+            "fallback_role": fallback_role,
+            "worker_mode": worker_mode,
+            "accumulated_cost": accumulated_cost,
+            "history": cost_data.get("history", []) if isinstance(cost_data, dict) else []
+        }
+        
         if os.path.exists(cost_tracker_path):
             try:
                 with open(cost_tracker_path, "r", encoding="utf-8") as f:
-                    cost_data = json.load(f)
+                    loaded_data = json.load(f)
+                    current_data.update(loaded_data)
             except Exception as e:
                 print(f"[Warning] Failed to reload cost_tracker.json: {e}")
                 
         # update accumulated_cost and history
-        current_accumulated_cost = cost_data.get("accumulated_cost", 0.0)
+        current_accumulated_cost = current_data.get("accumulated_cost", 0.0)
         new_accumulated_cost = current_accumulated_cost + call_cost
-        cost_data["accumulated_cost"] = round(new_accumulated_cost, 6)
-        if "history" not in cost_data:
-            cost_data["history"] = []
-        cost_data["history"].append({
+        current_data["accumulated_cost"] = round(new_accumulated_cost, 6)
+        if "history" not in current_data:
+            current_data["history"] = []
+        current_data["history"].append({
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "role": role,
             "model": model,
@@ -465,7 +476,7 @@ def main():
         
         try:
             with open(cost_tracker_path, "w", encoding="utf-8") as f:
-                json.dump(cost_data, f, indent=2, ensure_ascii=False)
+                json.dump(current_data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"[Warning] Failed to save cost_tracker.json: {e}")
             

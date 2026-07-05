@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import json
 
 def count_korean_characters(text):
     # 한글 글자만 필터링하여 카운트
@@ -35,55 +36,52 @@ def validate_file(task_name, file_path):
     
     # 규칙 검증
     is_valid = True
-    if filename == "context.md":
-        limit_korean = 1500
-        limit_english = 300
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    rules_path = os.path.join(base_dir, "validate_rules.json")
+    
+    if not os.path.exists(rules_path):
+        print(f"Error: validate_rules.json not found at '{rules_path}'")
+        sys.exit(1)
         
-        if korean_cnt > limit_korean:
-            diff = korean_cnt - limit_korean
-            pct = (diff / limit_korean) * 100
-            print(f"[FAIL] 'context.md' exceeds Korean character limit!")
-            print(f"       - Limit: {limit_korean} chars, Current: {korean_cnt} chars ({pct:.1f}% exceeded)")
-            print(f"       - Recommendation: Please trim the text by at least {diff} Korean characters.")
-            is_valid = False
-        else:
-            print(f"[PASS] Korean character count within limit ({korean_cnt}/{limit_korean})")
-            
-        if english_cnt > limit_english:
-            diff = english_cnt - limit_english
-            pct = (diff / limit_english) * 100
-            print(f"[FAIL] 'context.md' exceeds English word limit!")
-            print(f"       - Limit: {limit_english} words, Current: {english_cnt} words ({pct:.1f}% exceeded)")
-            print(f"       - Recommendation: Please trim the text by at least {diff} English words.")
-            is_valid = False
-        else:
-            print(f"[PASS] English word count within limit ({english_cnt}/{limit_english})")
-            
-    elif filename == "brief.md":
-        limit_korean = 1200
-        limit_english = 240
+    try:
+        with open(rules_path, "r", encoding="utf-8") as f:
+            rules_config = json.load(f)
+    except Exception as e:
+        print(f"Error: Failed to parse validate_rules.json: {e}")
+        sys.exit(1)
         
-        if korean_cnt > limit_korean:
-            diff = korean_cnt - limit_korean
-            pct = (diff / limit_korean) * 100
-            print(f"[FAIL] 'brief.md' exceeds Korean character limit!")
-            print(f"       - Limit: {limit_korean} chars, Current: {korean_cnt} chars ({pct:.1f}% exceeded)")
-            print(f"       - Recommendation: Please trim the text by at least {diff} Korean characters.")
-            is_valid = False
-        else:
-            print(f"[PASS] Korean character count within limit ({korean_cnt}/{limit_korean})")
-            
-        if english_cnt > limit_english:
-            diff = english_cnt - limit_english
-            pct = (diff / limit_english) * 100
-            print(f"[FAIL] 'brief.md' exceeds English word limit!")
-            print(f"       - Limit: {limit_english} words, Current: {english_cnt} words ({pct:.1f}% exceeded)")
-            print(f"       - Recommendation: Please trim the text by at least {diff} English words.")
-            is_valid = False
-        else:
-            print(f"[PASS] English word count within limit ({english_cnt}/{limit_english})")
-            
-    elif filename.endswith(".py"):
+    rules = rules_config.get("rules", {})
+    
+    # 1) 글자수 및 영어 단어수 한도 검사 (validate_rules.json 기반)
+    if filename in rules:
+        file_rules = rules[filename]
+        limit_korean = file_rules.get("limit_korean")
+        limit_english = file_rules.get("limit_english")
+        
+        if limit_korean is not None:
+            if korean_cnt > limit_korean:
+                diff = korean_cnt - limit_korean
+                pct = (diff / limit_korean) * 100
+                print(f"[FAIL] '{filename}' exceeds Korean character limit!")
+                print(f"       - Limit: {limit_korean} chars, Current: {korean_cnt} chars ({pct:.1f}% exceeded)")
+                print(f"       - Recommendation: Please trim the text by at least {diff} Korean characters.")
+                is_valid = False
+            else:
+                print(f"[PASS] Korean character count within limit ({korean_cnt}/{limit_korean})")
+                
+        if limit_english is not None:
+            if english_cnt > limit_english:
+                diff = english_cnt - limit_english
+                pct = (diff / limit_english) * 100
+                print(f"[FAIL] '{filename}' exceeds English word limit!")
+                print(f"       - Limit: {limit_english} words, Current: {english_cnt} words ({pct:.1f}% exceeded)")
+                print(f"       - Recommendation: Please trim the text by at least {diff} English words.")
+                is_valid = False
+            else:
+                print(f"[PASS] English word count within limit ({english_cnt}/{limit_english})")
+
+    # 2) 파일 형식별 구문 유효성 검사 (독립된 if 블록으로 분리)
+    if filename.endswith(".py"):
         import ast
         try:
             ast.parse(content)
@@ -98,7 +96,6 @@ def validate_file(task_name, file_path):
             is_valid = False
             
     elif filename.endswith(".json"):
-        import json
         try:
             json.loads(content)
             print("[PASS] JSON syntax validation check passed!")
@@ -113,11 +110,9 @@ def validate_file(task_name, file_path):
     elif filename.endswith(".js"):
         import subprocess
         try:
-            # node -c performs a syntax check without running the script
             result = subprocess.run(["node", "-c", file_path], capture_output=True, text=True, check=True)
             print("[PASS] JavaScript syntax validation check passed (via node -c)!")
         except FileNotFoundError:
-            # Node.js is not installed, skip or do a basic pass
             print("[INFO] Node.js not found. Skipping deep JavaScript syntax validation.")
         except subprocess.CalledProcessError as e:
             print(f"[FAIL] JavaScript syntax validation check failed!")

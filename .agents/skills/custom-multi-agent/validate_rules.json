@@ -1,0 +1,12 @@
+{
+  "rules": {
+    "context.md": {
+      "limit_korean": 1500,
+      "limit_english": 300
+    },
+    "brief.md": {
+      "limit_korean": 1200,
+      "limit_english": 240
+    }
+  }
+}

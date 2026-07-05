@@ -8,25 +8,7 @@ import urllib.error
 import time
 from pathlib import Path
 
-def load_api_keys():
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    search_paths = [
-        os.path.join(base_dir, "api_keys.json"),
-        os.path.join(os.path.dirname(base_dir), "api_keys.json"),
-        os.path.join(os.getcwd(), "api_keys.json")
-    ]
-    for p in search_paths:
-        if os.path.exists(p):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    keys = json.load(f)
-                for k, v in keys.items():
-                    if v and not v.startswith("your-") and v != "your_actual_key_here":
-                        os.environ[k] = v
-                return True
-            except Exception:
-                pass
-    return False
+from common_utils import load_api_keys
 
 def get_wiki_prompt(body, filename):
     return f"""다음 문서는 지식 보관소(Wiki)에 등록할 외부 원본 문서입니다.
