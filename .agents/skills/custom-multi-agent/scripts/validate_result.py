@@ -125,6 +125,17 @@ def validate_file(task_name, file_path):
             print(f"       - Error: {e.stderr.strip()}")
             is_valid = False
 
+    # critic_report.md 존재 체크 게이트
+    # 오직 워커의 최종 결과 제안서인 result.md 검증 시에만 critic_report.md가 실존하는지 확인
+    if filename == "result.md":
+        task_dir = os.path.dirname(file_path)
+        critic_report_path = os.path.join(task_dir, "critic_report.md")
+        if not os.path.exists(critic_report_path):
+            print("[FAIL] critic_report.md가 존재하지 않습니다. 비평 워커를 먼저 실행하십시오.")
+            is_valid = False
+        else:
+            print("[PASS] critic_report.md 존재 확인")
+
     if is_valid:
         print("[PASS] Verification checklist rules satisfied!")
         sys.exit(0)

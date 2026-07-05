@@ -34,6 +34,13 @@
       "description": "3.5세대 프리미엄 추론 모델. 대용량 코드베이스 통분석 및 비전 검증",
       "input_price_per_1m": 7.0,
       "output_price_per_1m": 21.0
+    },
+    "gemini-critic": {
+      "provider": "google",
+      "model": "gemini-3.5-flash",
+      "description": "경량 비평 전용. 코드 리뷰 및 품질 검증에 특화된 저비용 모델",
+      "input_price_per_1m": 0.15,
+      "output_price_per_1m": 0.60
     }
   }
 }
