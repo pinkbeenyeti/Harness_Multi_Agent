@@ -64,4 +64,11 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python init_task.py <task_name>")
         sys.exit(1)
+        
+    try:
+        from common_utils import check_for_updates
+        check_for_updates()
+    except Exception as e:
+        print(f"[Warning] Failed to import or run check_for_updates: {e}")
+
     init_task(sys.argv[1])
