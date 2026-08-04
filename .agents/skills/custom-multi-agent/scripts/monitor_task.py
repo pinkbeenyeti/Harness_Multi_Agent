@@ -24,19 +24,25 @@ def get_display_width(text):
             width += 1
     return width
 
+_ANSI_ESCAPE_RE = re.compile(r'\033\[[0-9;]*m')
+
 def pad_string(text, target_width):
     # ANSI 이스케이프 시퀀스 제거 후 폭 계산
-    clean_text = re.sub(r'\033\[[0-9;]*m', '', text)
+    clean_text = _ANSI_ESCAPE_RE.sub('', text)
     current_width = get_display_width(clean_text)
-    
+
     if current_width >= target_width:
         trimmed = ""
         temp_width = 0
-        for char in text:
-            # ANSI 이스케이프 문자는 그대로 포함하고 폭 계산에서 제외
-            if char == '\033':
-                # 단순 이스케이프 시퀀스 스킵
-                pass
+        pos = 0
+        while pos < len(text):
+            # ANSI 이스케이프 시퀀스는 통째로 그대로 옮기고 폭 계산에서 제외
+            match = _ANSI_ESCAPE_RE.match(text, pos)
+            if match:
+                trimmed += match.group(0)
+                pos = match.end()
+                continue
+            char = text[pos]
             char_w = 2 if (0x1100 <= ord(char) <= 0x11FF or 0xAC00 <= ord(char) <= 0xD7A3 or 0x3130 <= ord(char) <= 0x318F) else 1
             if temp_width + char_w > target_width - 3:
                 trimmed += "..."
@@ -44,6 +50,7 @@ def pad_string(text, target_width):
                 break
             trimmed += char
             temp_width += char_w
+            pos += 1
         return trimmed + " " * (target_width - temp_width)
     return text + " " * (target_width - current_width)
 
