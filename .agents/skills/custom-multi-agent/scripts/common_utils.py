@@ -2,6 +2,25 @@ import os
 import json
 import subprocess
 
+def load_backend_config(role):
+    """
+    backends.json에서 워커 역할(role)에 대응하는 provider/model 설정을 읽어온다.
+    call_worker.py와 knot_manager.py가 이 함수를 공유하여, 모델명이 각 스크립트에
+    개별적으로 하드코딩되어 backends.json 설정과 어긋나는 드리프트를 방지한다.
+    """
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = os.path.join(base_dir, "backends.json")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    workers = config.get("workers", {})
+    if role not in workers:
+        raise KeyError(f"Role '{role}' is not defined in backends.json")
+
+    return workers[role]
+
+
 def load_api_keys():
     # 1. 스크립트 실행 위치 및 오케스트레이터의 작업 폴더(cwd) 기준 여러 경로에서 api_keys.json 로드 시도
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,12 +46,16 @@ def load_api_keys():
     return False
 
 
-def _run_git_cmd(args, timeout=5):
+def _run_git_cmd(args, cwd, timeout=5):
     """
-    git subprocess 호출을 위한 공용 헬퍼 함수
+    git subprocess 호출을 위한 공용 헬퍼 함수.
+    cwd를 명시적으로 지정하여, 이 스킬이 다른 프로젝트에 설치되었을 때
+    호출자의 현재 작업 폴더(호스트 프로젝트 저장소)가 아닌
+    스킬 자신의 설치 경로를 대상으로만 git 명령이 실행되도록 강제한다.
     """
     return subprocess.run(
         ["git"] + args,
+        cwd=cwd,
         capture_output=True,
         text=True,
         check=True,
@@ -45,32 +68,34 @@ def check_for_updates():
     깃허브 원격 저장소의 업데이트를 확인하고, 사용자 승인 시 자동 업데이트를 진행합니다.
     네트워크 문제, git 미설치 등으로 인한 모든 예외는 경고 메시지만 출력하고 무시됩니다.
     """
+    # 스킬 자신의 설치 경로(scripts/의 상위 폴더)를 git 명령의 기준 디렉토리로 고정.
+    skill_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     try:
         # 1. 로컬 변경사항(unstaged/staged) 확인 (충돌 예방 안전장치)
-        status_res = _run_git_cmd(["status", "--porcelain"], timeout=3)
+        status_res = _run_git_cmd(["status", "--porcelain"], skill_dir, timeout=3)
         if status_res.stdout.strip():
             print("\n⚠️ [Warning] 로컬 저장소에 커밋되지 않은 변경사항이 존재합니다.")
             print("안전한 업데이트를 위해 작업을 먼저 커밋하거나 stashing 후 다시 실행하십시오.")
             return
 
         # 2. git fetch origin 수행 (타임아웃 3초)
-        _run_git_cmd(["fetch", "origin"], timeout=3)
-        
+        _run_git_cmd(["fetch", "origin"], skill_dir, timeout=3)
+
         # 3. 로컬 및 원격 해시 구하기
-        local_hash = _run_git_cmd(["rev-parse", "HEAD"], timeout=3).stdout.strip()
-        
+        local_hash = _run_git_cmd(["rev-parse", "HEAD"], skill_dir, timeout=3).stdout.strip()
+
         remote_hash = None
         try:
-            remote_hash = _run_git_cmd(["rev-parse", "@{u}"], timeout=3).stdout.strip()
+            remote_hash = _run_git_cmd(["rev-parse", "@{u}"], skill_dir, timeout=3).stdout.strip()
         except subprocess.CalledProcessError:
             try:
-                remote_hash = _run_git_cmd(["rev-parse", "origin/main"], timeout=3).stdout.strip()
+                remote_hash = _run_git_cmd(["rev-parse", "origin/main"], skill_dir, timeout=3).stdout.strip()
             except subprocess.CalledProcessError:
                 pass
-        
+
         if not remote_hash:
             return
-            
+
         # 4. 업데이트 여부 비교 및 y/n 대기 루프
         if local_hash != remote_hash:
             while True:
@@ -78,14 +103,14 @@ def check_for_updates():
                 if user_input in ["y", "yes"]:
                     # 현재 브랜치명 추출
                     try:
-                        branch_name = _run_git_cmd(["rev-parse", "--abbrev-ref", "HEAD"], timeout=3).stdout.strip()
+                        branch_name = _run_git_cmd(["rev-parse", "--abbrev-ref", "HEAD"], skill_dir, timeout=3).stdout.strip()
                     except subprocess.CalledProcessError:
                         branch_name = "main"
-                    
+
                     # git pull 실행 (타임아웃 10초 설정으로 행 방지)
                     try:
                         print(f"Applying updates from origin/{branch_name}...")
-                        _run_git_cmd(["pull", "origin", branch_name], timeout=10)
+                        _run_git_cmd(["pull", "origin", branch_name], skill_dir, timeout=10)
                         print("[Multi-Agent Update] 업데이트가 성공적으로 반영되었습니다. 변경사항을 적용하기 위해 프로그램을 재시작하십시오.")
                     except subprocess.CalledProcessError as pull_err:
                         print(f"\n⚠️ [Warning] git pull 과정에서 실패가 발생했습니다: {pull_err}")

@@ -9,7 +9,26 @@ import urllib.error
 import time
 from pathlib import Path
 
-from common_utils import load_api_keys
+from common_utils import load_api_keys, load_backend_config
+
+# 각 provider의 위키 요약용 기본 모델. backends.json에 해당 role이 없을 때만 사용되는 폴백값.
+_WIKI_MODEL_FALLBACK = {
+    "gemini": "gemini-3.5-flash",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-3-5-haiku-20241022",
+}
+
+def _resolve_wiki_model(role, provider_key):
+    """
+    backends.json에 정의된 role의 모델명을 우선 사용하고, role이 없거나 설정 로드에
+    실패하면 최소 동작을 보장하기 위한 폴백 모델로 대체한다. 이렇게 하면 call_worker.py
+    쪽 backends.json 설정이 바뀌어도 knot_manager.py가 별도로 하드코딩된 구버전 모델을
+    계속 사용하는 드리프트가 발생하지 않는다.
+    """
+    try:
+        return load_backend_config(role)["model"]
+    except (FileNotFoundError, KeyError, ValueError):
+        return _WIKI_MODEL_FALLBACK[provider_key]
 
 def get_wiki_prompt(body, filename):
     return f"""다음 문서는 지식 보관소(Wiki)에 등록할 외부 원본 문서입니다.
@@ -34,7 +53,8 @@ def call_llm_for_wiki(body, filename):
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if gemini_key:
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={gemini_key}"
+            gemini_model = _resolve_wiki_model("gemini-critic", "gemini")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
             headers = {"Content-Type": "application/json"}
             prompt = get_wiki_prompt(body, filename)
             data = {"contents": [{"parts": [{"text": prompt}]}]}
@@ -56,7 +76,7 @@ def call_llm_for_wiki(body, filename):
             }
             prompt = get_wiki_prompt(body, filename)
             data = {
-                "model": "gpt-4o-mini",
+                "model": _WIKI_MODEL_FALLBACK["openai"],
                 "messages": [{"role": "user", "content": prompt}]
             }
             req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
@@ -78,7 +98,7 @@ def call_llm_for_wiki(body, filename):
             }
             prompt = get_wiki_prompt(body, filename)
             data = {
-                "model": "claude-3-5-haiku-20241022",
+                "model": _WIKI_MODEL_FALLBACK["anthropic"],
                 "max_tokens": 2000,
                 "messages": [{"role": "user", "content": prompt}]
             }

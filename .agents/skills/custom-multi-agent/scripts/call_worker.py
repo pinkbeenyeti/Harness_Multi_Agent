@@ -14,25 +14,18 @@ import urllib.error
 import time
 import asyncio
 from datetime import datetime
-from common_utils import load_api_keys
+from common_utils import load_api_keys, load_backend_config as _shared_load_backend_config
 
 def load_backend_config(role):
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    config_path = os.path.join(base_dir, "backends.json")
-    
-    if not os.path.exists(config_path):
-        print(f"Error: backends.json not found at '{config_path}'")
+    try:
+        return _shared_load_backend_config(role)
+    except FileNotFoundError:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        print(f"Error: backends.json not found at '{os.path.join(base_dir, 'backends.json')}'")
         sys.exit(1)
-        
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
-        
-    workers = config.get("workers", {})
-    if role not in workers:
-        print(f"Error: Role '{role}' is not defined in backends.json")
+    except KeyError as e:
+        print(f"Error: {e}")
         sys.exit(1)
-        
-    return workers[role]
 
 def call_anthropic(model, prompt, system_prompt=None):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
