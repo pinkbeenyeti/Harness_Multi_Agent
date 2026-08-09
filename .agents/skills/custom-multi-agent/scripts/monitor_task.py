@@ -1,6 +1,8 @@
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 # Windows cp949 인코딩 크래시 방지
 if hasattr(sys.stdout, 'reconfigure'):
     try:
@@ -10,6 +12,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 import time
 import re
 from datetime import datetime
+from common_utils import parse_log_line
 
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -103,12 +106,17 @@ def read_last_logs(log_md_path, limit=10):
     try:
         with open(log_md_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
-            
-        log_pattern = r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}'
+
+        # 포맷 판별은 common_utils.parse_log_line에 위임한다.
+        # 구형/신형 두 포맷을 모두 인식하며, 표시는 정규화된 형태로 통일한다.
         for line in lines:
-            if re.match(log_pattern, line.strip()):
-                logs.append(line.strip())
-                
+            parsed = parse_log_line(line.rstrip("\n"))
+            if not parsed:
+                continue
+            tag, date, hhmm, text = parsed
+            stamp = f"{date} {hhmm}" if hhmm else date
+            logs.append(f"{stamp} [{tag}] {text}")
+
         return logs[-limit:]
     except Exception as e:
         return [f"Error reading logs: {e}"]

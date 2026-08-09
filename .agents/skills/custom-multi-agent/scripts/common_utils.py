@@ -1,6 +1,49 @@
 import os
 import json
+import re
 import subprocess
+
+# ---------------------------------------------------------------------------
+# log.md 항목 파서 (공용)
+#
+# 실사용 중 로그 포맷이 두 갈래로 드리프트했다. monitor_task.py와
+# collect_metrics.py가 각자 정규식을 들고 있으면 한쪽만 조용히 못 읽는 사고가
+# 반복되므로(실제로 발생함) 파서를 여기 한 곳에 둔다.
+#   구형(템플릿): 2026-08-06 10:43 [DECISION] 내용
+#   신형(실사용): - `[FACT]` 2026-08-08 19:05 — 내용   (시각 생략 가능)
+# ---------------------------------------------------------------------------
+LOG_RE_DATE_FIRST = re.compile(
+    r'^\s*[-*]?\s*(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}:\d{2}))?\s+`?\[([A-Z_]+)\]`?\s*(.*)$')
+LOG_RE_TAG_FIRST = re.compile(
+    r'^\s*[-*]?\s*`?\[([A-Z_]+)\]`?\s*(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}:\d{2}))?\s*[—\-]?\s*(.*)$')
+
+# 실사용 중 생긴 태그 변종을 표준 태그로 흡수한다.
+LOG_TAG_ALIASES = {
+    "WORKER": "WORKER_CALL",
+    "WORKER_START": "WORKER_CALL",
+    "GATE": "APPROVAL",
+    "FACT": "DECISION",
+}
+
+
+def parse_log_line(line):
+    """
+    log.md 한 줄을 (tag, date, time_or_None, text)로 해석한다.
+    로그 항목이 아니면(헤더, 들여쓴 부속 설명 등) None을 반환한다.
+    """
+    m = LOG_RE_DATE_FIRST.match(line)
+    if m:
+        date, hhmm, tag, text = m.group(1), m.group(2), m.group(3), m.group(4)
+    else:
+        m = LOG_RE_TAG_FIRST.match(line)
+        if not m:
+            return None
+        tag, date, hhmm, text = m.group(1), m.group(2), m.group(3), m.group(4)
+
+    if tag == "TAG":  # 템플릿 안내문의 예시 줄
+        return None
+    return LOG_TAG_ALIASES.get(tag, tag), date, hhmm, text
+
 
 def load_backend_config(role):
     """
