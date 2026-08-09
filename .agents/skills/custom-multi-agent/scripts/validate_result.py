@@ -176,16 +176,22 @@ def validate_file(task_name, file_path):
             print(f"       - Error: {e.stderr.strip()}")
             is_valid = False
 
-    # critic_report.md 존재 체크 게이트
-    # 오직 워커의 최종 결과 제안서인 result.md 검증 시에만 critic_report.md가 실존하는지 확인
-    if filename == "result.md":
+    # 비평 보고서 존재 체크 게이트
+    #
+    # 워커를 병렬로 돌리면 result_<그룹>.md / critic_report_<그룹>.md 쌍이 생긴다.
+    # 접미사를 그대로 이어붙여 짝을 찾으므로, 병렬 실행에서도 그룹마다
+    # 비평이 강제된다. (예전에는 정확히 'result.md'일 때만 검사해서,
+    # 접미사가 붙는 순간 게이트가 조용히 통과됐다.)
+    if filename.startswith("result") and filename.endswith(".md"):
+        suffix = filename[len("result"):-len(".md")]
+        critic_name = f"critic_report{suffix}.md"
         task_dir = os.path.dirname(file_path)
-        critic_report_path = os.path.join(task_dir, "critic_report.md")
+        critic_report_path = os.path.join(task_dir, critic_name)
         if not os.path.exists(critic_report_path):
-            print("[FAIL] critic_report.md가 존재하지 않습니다. 비평 워커를 먼저 실행하십시오.")
+            print(f"[FAIL] {critic_name}가 존재하지 않습니다. 비평 워커를 먼저 실행하십시오.")
             is_valid = False
         else:
-            print("[PASS] critic_report.md 존재 확인")
+            print(f"[PASS] {critic_name} 존재 확인")
 
     if is_valid:
         print("[PASS] Verification checklist rules satisfied!")

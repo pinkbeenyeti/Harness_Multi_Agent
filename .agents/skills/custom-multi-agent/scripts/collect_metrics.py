@@ -202,7 +202,16 @@ def measure_fixed_overhead(base_dir):
 # (35개 태스크 중 17개가 크리틱 검증 기록 0건, 21개가 승인 기록 0건).
 # 여기서 로그를 근거로 위반을 적발한다.
 # ---------------------------------------------------------------------------
-def check_compliance(tags):
+def check_compliance(tags, groups=1):
+    """
+    groups: 병렬 실행 그룹 수(= result*.md 개수). 워커를 파일 그룹별로 병렬
+    기동하면 그룹 수만큼 호출이 늘어나는 것이 정상이므로, 교정 루프 상한도
+    그룹 수에 비례해 확장한다. 상한이 통제하는 것은 '호출 총량'이 아니라
+    '한 그룹을 몇 번이나 다시 고쳤는가'다.
+    """
+    groups = max(1, groups)
+    call_limit = MAX_WORKER_CALLS * groups
+
     worker_calls = tags.get("WORKER_CALL", 0)
     verifications = tags.get("VERIFICATION", 0)
     approvals = tags.get("APPROVAL", 0)
@@ -216,18 +225,21 @@ def check_compliance(tags):
         violations.append(
             "APPROVAL_UNLOGGED: 워커가 실행됐으나 사용자 승인 기록이 0건입니다. "
             "승인 즉시 log.md에 [APPROVAL]을 남겨야 감사 추적이 됩니다.")
-    if worker_calls > MAX_WORKER_CALLS:
+    if worker_calls > call_limit:
+        detail = f"{MAX_WORKER_CALLS}회 × {groups}그룹" if groups > 1 else f"{MAX_WORKER_CALLS}회 = 최초 1 + 교정 3"
         violations.append(
             f"CORRECTION_LOOP_EXCEEDED: 워커 호출 {worker_calls}회로 상한"
-            f"({MAX_WORKER_CALLS}회 = 최초 1 + 교정 3)을 넘었습니다. "
+            f"({call_limit}회, {detail})을 넘었습니다. "
             "교정을 반복하지 말고 사용자에게 에스컬레이션했어야 합니다.")
 
     return {
         "ok": not violations,
         "violations": violations,
+        "parallel_groups": groups,
+        "worker_call_limit": call_limit,
         "critic_missing": worker_calls > 0 and verifications == 0,
         "approval_unlogged": worker_calls > 0 and approvals == 0,
-        "correction_loop_exceeded": worker_calls > MAX_WORKER_CALLS,
+        "correction_loop_exceeded": worker_calls > call_limit,
     }
 
 
@@ -250,6 +262,9 @@ def build_metrics(base_dir, task_name):
     artifact_tok = worker_tok + critic_tok + brief_tok + orch_tok
 
     worker_code = artifacts.get("worker", {}).get("code_tokens", 0)
+
+    # 병렬 실행 그룹 수 = 워커가 만든 result*.md 개수 (없으면 1로 본다)
+    parallel_groups = max(1, len(artifacts.get("worker", {}).get("files", [])))
 
     tags = log_stats["tags"]
     worker_calls = tags.get("WORKER_CALL", 0)
@@ -294,7 +309,7 @@ def build_metrics(base_dir, task_name):
             "resident_overhead_cumulative": overhead.get("resident_tokens", 0) * max(log_stats["entries"], 1),
             "estimated_reconsumption_tokens": reconsumption,
         },
-        "compliance": check_compliance(tags),
+        "compliance": check_compliance(tags, groups=parallel_groups),
         "fixed_overhead": overhead,
         "artifacts": {k: {"bytes": v["bytes"], "total_tokens": v["total_tokens"],
                           "code_tokens": v["code_tokens"], "prose_tokens": v["prose_tokens"],
