@@ -16,6 +16,13 @@ import asyncio
 from datetime import datetime
 from common_utils import load_api_keys, load_backend_config as _shared_load_backend_config
 
+# 워커 응답의 출력 토큰 상한.
+# 이전에는 anthropic 경로에만 4000이 걸려 있었고, 상한에 닿아도 아무 신호 없이
+# 잘린 result.md가 그대로 저장됐다. 상한을 올리고, 상한에 닿았는지를
+# provider별 종료 사유로 감지해 조용한 잘림을 에러로 승격한다.
+MAX_OUTPUT_TOKENS = 8000
+
+
 def load_backend_config(role):
     try:
         return _shared_load_backend_config(role)
@@ -41,7 +48,7 @@ def call_anthropic(model, prompt, system_prompt=None):
     
     data = {
         "model": model,
-        "max_tokens": 4000,
+        "max_tokens": MAX_OUTPUT_TOKENS,
         "messages": [
             {"role": "user", "content": prompt}
         ]
@@ -58,7 +65,8 @@ def call_anthropic(model, prompt, system_prompt=None):
                 res_data = json.loads(response.read().decode("utf-8"))
                 input_tokens = res_data.get("usage", {}).get("input_tokens", 0)
                 output_tokens = res_data.get("usage", {}).get("output_tokens", 0)
-                return res_data["content"][0]["text"], input_tokens, output_tokens
+                truncated = res_data.get("stop_reason") == "max_tokens"
+                return res_data["content"][0]["text"], input_tokens, output_tokens, truncated
         except urllib.error.HTTPError as e:
             err_msg = e.read().decode('utf-8', errors='ignore')
             if attempt < max_retries - 1:
@@ -91,11 +99,14 @@ def call_openai(model, prompt, system_prompt=None):
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
+    # OpenAI 계열은 모델 세대에 따라 출력 상한 파라미터명이 다르다(max_tokens /
+    # max_completion_tokens). 잘못 보내면 400이 나므로 상한은 모델 기본값에 맡기고,
+    # 대신 finish_reason으로 잘림을 감지한다.
     data = {
         "model": model,
         "messages": messages
     }
-    
+
     req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
     
     max_retries = 3
@@ -105,7 +116,8 @@ def call_openai(model, prompt, system_prompt=None):
                 res_data = json.loads(response.read().decode("utf-8"))
                 input_tokens = res_data.get("usage", {}).get("prompt_tokens", 0)
                 output_tokens = res_data.get("usage", {}).get("completion_tokens", 0)
-                return res_data["choices"][0]["message"]["content"], input_tokens, output_tokens
+                truncated = res_data["choices"][0].get("finish_reason") == "length"
+                return res_data["choices"][0]["message"]["content"], input_tokens, output_tokens, truncated
         except urllib.error.HTTPError as e:
             err_msg = e.read().decode('utf-8', errors='ignore')
             if attempt < max_retries - 1:
@@ -135,7 +147,8 @@ def call_google(model, prompt, system_prompt=None):
     data = {
         "contents": [{
             "parts": [{"text": prompt}]
-        }]
+        }],
+        "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS}
     }
     if system_prompt:
         data["systemInstruction"] = {
@@ -152,7 +165,8 @@ def call_google(model, prompt, system_prompt=None):
                 usage = res_data.get("usageMetadata", {})
                 input_tokens = usage.get("promptTokenCount", 0)
                 output_tokens = usage.get("candidatesTokenCount", 0)
-                return res_data["candidates"][0]["content"]["parts"][0]["text"], input_tokens, output_tokens
+                truncated = res_data["candidates"][0].get("finishReason") == "MAX_TOKENS"
+                return res_data["candidates"][0]["content"]["parts"][0]["text"], input_tokens, output_tokens, truncated
         except urllib.error.HTTPError as e:
             err_msg = e.read().decode('utf-8', errors='ignore')
             if attempt < max_retries - 1:
@@ -191,7 +205,8 @@ async def call_antigravity_sdk(prompt, system_prompt=None):
         # 간이 토큰 계산 (1토큰 ~ 4글자 기준)
         input_tokens = len(prompt) // 4
         output_tokens = len(content) // 4
-        return content, input_tokens, output_tokens
+        # SDK 스트리밍은 종료 사유를 노출하지 않으므로 잘림 판정을 하지 않는다.
+        return content, input_tokens, output_tokens, False
 
 def safe_run_async(coro):
     try:
@@ -391,16 +406,17 @@ def main():
     result_text = ""
     input_tokens = 0
     output_tokens = 0
-    
+    truncated = False
+
     try:
         if provider == "anthropic":
-            result_text, input_tokens, output_tokens = call_anthropic(model, prompt, system_prompt)
+            result_text, input_tokens, output_tokens, truncated = call_anthropic(model, prompt, system_prompt)
         elif provider == "openai":
-            result_text, input_tokens, output_tokens = call_openai(model, prompt, system_prompt)
+            result_text, input_tokens, output_tokens, truncated = call_openai(model, prompt, system_prompt)
         elif provider == "google":
-            result_text, input_tokens, output_tokens = call_google(model, prompt, system_prompt)
+            result_text, input_tokens, output_tokens, truncated = call_google(model, prompt, system_prompt)
         elif provider == "antigravity":
-            result_text, input_tokens, output_tokens = safe_run_async(call_antigravity_sdk(prompt, system_prompt))
+            result_text, input_tokens, output_tokens, truncated = safe_run_async(call_antigravity_sdk(prompt, system_prompt))
         else:
             print(f"Error: Unsupported provider '{provider}'")
             sys.exit(1)
@@ -419,6 +435,27 @@ def main():
                 lf.write(f"\n{current_time} [ERROR] '{role}' ({model}) API 호출 실패. 원인: {error_msg}")
         sys.exit(1)
         
+    # 3.05 출력 상한 도달(잘림) 감지
+    # 잘린 응답을 정상 result.md로 저장하면 diff가 중간에 끊긴 채 병합되어
+    # 소리 없이 깨진 코드가 반영된다. 부분 결과는 진단용으로 남기되 실패로 처리한다.
+    if truncated:
+        banner = (f"<!-- TRUNCATED: 워커 '{role}'({model}) 응답이 출력 상한"
+                  f"({MAX_OUTPUT_TOKENS} tokens)에 도달해 중간에 잘렸습니다. "
+                  f"이 파일을 병합하지 마십시오. 브리프 범위를 쪼개 재호출하십시오. -->\n\n")
+        with open(result_path, "w", encoding="utf-8") as f:
+            f.write(banner + result_text)
+
+        print(f"[TRUNCATED] 워커 응답이 출력 상한에 도달해 잘렸습니다. '{result_path}'는 불완전합니다.")
+        print("[TRUNCATED] 브리프의 In Scope를 더 작게 쪼개어 재호출하십시오.")
+        update_task_status(task_dir, f"error (Worker '{role}' output truncated)")
+
+        if os.path.exists(log_path):
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+            with open(log_path, "a", encoding="utf-8") as lf:
+                lf.write(f"\n{current_time} [ERROR] '{role}' ({model}) 응답이 출력 상한"
+                         f"({MAX_OUTPUT_TOKENS} tokens)에 도달해 잘렸습니다. result.md 병합 금지, 범위 분할 후 재호출 필요.")
+        sys.exit(3)
+
     # 3.1 비용 계산 및 누적 업데이트
     input_price = worker_cfg.get("input_price_per_1m", 0.0)
     output_price = worker_cfg.get("output_price_per_1m", 0.0)

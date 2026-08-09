@@ -29,6 +29,10 @@ TOKENS_PER_ASCII_CHAR = 0.27
 
 FENCE_RE = re.compile(r'^\s*```')
 
+# 교정 루프 상한: 최초 1회 + 교정 3회. 이를 넘으면 워커를 계속 돌리지 말고
+# 사용자에게 에스컬레이션해야 한다(실측 최악 사례: 워커 호출 24회 / 라운드트립 72회).
+MAX_WORKER_CALLS = 4
+
 
 def is_hangul(ch):
     o = ord(ch)
@@ -56,9 +60,20 @@ def split_code_prose(text):
     return "".join(code_lines), "".join(prose_lines)
 
 
+METRICS_LINE_RE = re.compile(r'\[METRICS\]')
+
+
 def measure_file(path):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
+
+    # log.md는 이 스크립트가 [METRICS] 줄을 덧붙이는 대상이기도 하다. 그대로 재면
+    # 측정할 때마다 log.md가 커져 다음 측정값이 달라진다(자기 참조). 계측이 남긴
+    # 줄은 측정 대상에서 뺀다.
+    if os.path.basename(path).lower() == "log.md":
+        content = "".join(l for l in content.splitlines(keepends=True)
+                          if not METRICS_LINE_RE.search(l))
+
     code, prose = split_code_prose(content)
     return {
         "file": os.path.basename(path),
@@ -113,6 +128,10 @@ def parse_log(log_path):
             if not parsed:
                 continue  # 연속 들여쓰기 줄은 직전 항목의 부속 내용이므로 건너뛴다
             tag, date, hhmm, text = parsed
+            # [METRICS]는 이 스크립트 자신이 남긴 계측 기록이다. 세면 측정이
+            # 자기 출력을 다시 측정하게 되어 재실행할 때마다 수치가 늘어난다.
+            if tag == "METRICS":
+                continue
             try:
                 ts = datetime.strptime(f"{date} {hhmm}" if hhmm else date,
                                        "%Y-%m-%d %H:%M" if hhmm else "%Y-%m-%d")
@@ -174,6 +193,42 @@ def measure_fixed_overhead(base_dir):
         result["SKILL.md"] = {"bytes": m["bytes"], "tokens": m["total_tokens"]}
     result["resident_tokens"] = sum(v["tokens"] for v in result.values() if isinstance(v, dict))
     return result
+
+
+# ---------------------------------------------------------------------------
+# 규칙 준수 검사
+#
+# 규칙을 SKILL.md에만 적어두면 지켜지지 않는다는 것이 실측으로 확인됐다
+# (35개 태스크 중 17개가 크리틱 검증 기록 0건, 21개가 승인 기록 0건).
+# 여기서 로그를 근거로 위반을 적발한다.
+# ---------------------------------------------------------------------------
+def check_compliance(tags):
+    worker_calls = tags.get("WORKER_CALL", 0)
+    verifications = tags.get("VERIFICATION", 0)
+    approvals = tags.get("APPROVAL", 0)
+
+    violations = []
+    if worker_calls > 0 and verifications == 0:
+        violations.append(
+            "CRITIC_MISSING: 워커가 실행됐으나 비평 워커 검증 기록이 0건입니다. "
+            "비평 워커는 어떤 Tier에서도 생략할 수 없습니다.")
+    if worker_calls > 0 and approvals == 0:
+        violations.append(
+            "APPROVAL_UNLOGGED: 워커가 실행됐으나 사용자 승인 기록이 0건입니다. "
+            "승인 즉시 log.md에 [APPROVAL]을 남겨야 감사 추적이 됩니다.")
+    if worker_calls > MAX_WORKER_CALLS:
+        violations.append(
+            f"CORRECTION_LOOP_EXCEEDED: 워커 호출 {worker_calls}회로 상한"
+            f"({MAX_WORKER_CALLS}회 = 최초 1 + 교정 3)을 넘었습니다. "
+            "교정을 반복하지 말고 사용자에게 에스컬레이션했어야 합니다.")
+
+    return {
+        "ok": not violations,
+        "violations": violations,
+        "critic_missing": worker_calls > 0 and verifications == 0,
+        "approval_unlogged": worker_calls > 0 and approvals == 0,
+        "correction_loop_exceeded": worker_calls > MAX_WORKER_CALLS,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +294,7 @@ def build_metrics(base_dir, task_name):
             "resident_overhead_cumulative": overhead.get("resident_tokens", 0) * max(log_stats["entries"], 1),
             "estimated_reconsumption_tokens": reconsumption,
         },
+        "compliance": check_compliance(tags),
         "fixed_overhead": overhead,
         "artifacts": {k: {"bytes": v["bytes"], "total_tokens": v["total_tokens"],
                           "code_tokens": v["code_tokens"], "prose_tokens": v["prose_tokens"],
@@ -250,6 +306,36 @@ def build_metrics(base_dir, task_name):
 # ---------------------------------------------------------------------------
 # 저장
 # ---------------------------------------------------------------------------
+def compact_snapshot(metrics):
+    """
+    metrics_history에 쌓을 축약본. 전문을 매번 쌓으면 파일이 비대해지므로
+    시계열 비교에 필요한 수치만 남긴다.
+    """
+    d = metrics["derived"]
+    return {
+        "measured_at": metrics["measured_at"],
+        "log_entries": metrics["roundtrips"]["log_entries"],
+        "worker_calls": metrics["roundtrips"]["worker_calls"],
+        "verifications": metrics["roundtrips"]["verifications"],
+        "user_approvals": metrics["roundtrips"]["user_approvals"],
+        "elapsed_min": metrics["wallclock"]["elapsed_min"],
+        "artifact_tokens": dict(metrics["artifact_tokens"]),
+        "worker_code_share_pct": d["worker_code_share_pct"],
+        "critic_share_pct": d["critic_share_pct"],
+        "resident_overhead_tokens": d["resident_overhead_tokens"],
+        "compliance_violations": len(metrics["compliance"]["violations"]),
+    }
+
+
+def _same_measurement(a, b):
+    """측정 시각만 다르고 수치가 동일하면 같은 측정으로 본다."""
+    if not a or not b:
+        return False
+    ka = {k: v for k, v in a.items() if k != "measured_at"}
+    kb = {k: v for k, v in b.items() if k != "measured_at"}
+    return ka == kb
+
+
 def persist(base_dir, task_name, metrics):
     task_dir = os.path.join(base_dir, "tasks", task_name)
 
@@ -270,13 +356,25 @@ def persist(base_dir, task_name, metrics):
     data.setdefault("fallback_role", "gemini")
     data.setdefault("worker_mode", "multi-api")
     data.setdefault("history", [])
+
+    # metrics는 최신본으로 덮어쓰되, 축약 이력은 append-only로 누적한다.
+    # 덮어쓰기만 하면 개선 전/후 비교의 기준선이 재측정 시 사라진다.
+    hist = data.get("metrics_history")
+    if not isinstance(hist, list):
+        hist = []
+    snap = compact_snapshot(metrics)
+    changed = not _same_measurement(hist[-1] if hist else None, snap)
+    if changed:
+        hist.append(snap)
+    data["metrics_history"] = hist
     data["metrics"] = metrics
 
     with open(tracker_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+    # 수치가 그대로면 로그에 같은 줄을 또 남기지 않는다(재실행 시 로그 오염 방지).
     log_path = os.path.join(task_dir, "log.md")
-    if os.path.exists(log_path):
+    if changed and os.path.exists(log_path):
         a = metrics["artifact_tokens"]
         w = metrics["wallclock"]
         r = metrics["roundtrips"]
@@ -288,7 +386,7 @@ def persist(base_dir, task_name, metrics):
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line)
 
-    return tracker_path
+    return tracker_path, hist
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +427,44 @@ def print_report(m):
     print(f"  상주 규칙문서           : {d['resident_overhead_tokens']:,}토큰/턴 "
           f"(누적 추정 {d['resident_overhead_cumulative']:,}) → D(SKILL.md 다이어트) 효과 상한")
     print(f"  산출물 재소비 추정      : {d['estimated_reconsumption_tokens']:,}토큰")
+
+    c = m["compliance"]
+    print("\n[규칙 준수]")
+    if c["ok"]:
+        print("  ✅ 위반 없음")
+    else:
+        for v in c["violations"]:
+            print(f"  ❌ {v}")
+    print()
+
+
+def print_delta(history):
+    """최초 측정(베이스라인) 대비 최신 측정의 변화를 출력한다."""
+    if len(history) < 2:
+        return
+    base, cur = history[0], history[-1]
+    print(f"[베이스라인 대비] {base['measured_at']} → {cur['measured_at']}")
+
+    def row(label, key, unit="", pct=False):
+        b, c = base.get(key, 0), cur.get(key, 0)
+        if b == c:
+            return
+        if pct:
+            print(f"  {label:<22}: {b}{unit} → {c}{unit} ({c - b:+.1f}p)")
+        else:
+            delta_pct = ((c - b) / b * 100) if b else 0.0
+            print(f"  {label:<22}: {b:,}{unit} → {c:,}{unit} ({delta_pct:+.1f}%)")
+
+    row("라운드트립", "log_entries", "회")
+    row("경과", "elapsed_min", "분")
+    b_art, c_art = base.get("artifact_tokens", {}), cur.get("artifact_tokens", {})
+    for label, key in (("워커 산출물", "worker_result"), ("크리틱 산출물", "critic_report"), ("산출물 합계", "total")):
+        b, c = b_art.get(key, 0), c_art.get(key, 0)
+        if b != c:
+            print(f"  {label:<22}: {b:,} → {c:,} ({((c - b) / b * 100) if b else 0:+.1f}%)")
+    row("코드블록 비중", "worker_code_share_pct", "%", pct=True)
+    row("크리틱 비중", "critic_share_pct", "%", pct=True)
+    row("상주 규칙문서", "resident_overhead_tokens", "토큰")
     print()
 
 
@@ -358,16 +494,19 @@ def print_summary_table(rows):
 
 
 def main():
-    args = [a for a in sys.argv[1:]]
-    dry = "--dry" in args
-    args = [a for a in args if not a.startswith("--") or a == "--all"]
+    raw = sys.argv[1:]
+    dry = "--dry" in raw
+    strict = "--strict" in raw
+    args = [a for a in raw if not a.startswith("--") or a == "--all"]
 
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     tasks_dir = os.path.join(base_dir, "tasks")
 
     if not args:
-        print("Usage: python collect_metrics.py <task-name> [--dry]")
-        print("       python collect_metrics.py --all [--dry]")
+        print("Usage: python collect_metrics.py <task-name> [--dry] [--strict]")
+        print("       python collect_metrics.py --all [--dry] [--strict]")
+        print("  --dry    : 파일에 기록하지 않고 출력만 한다")
+        print("  --strict : 규칙 위반이 있으면 exit code 1로 종료한다 (태스크 완료 시 권장)")
         sys.exit(1)
 
     if args[0] == "--all":
@@ -384,16 +523,37 @@ def main():
             if not dry:
                 persist(base_dir, name, m)
         print_summary_table(rows)
+
+        offenders = [m for m in rows if not m["compliance"]["ok"]]
+        if offenders:
+            print(f"[규칙 준수] 위반 태스크 {len(offenders)}/{len(rows)}개")
+            for m in offenders:
+                codes = []
+                c = m["compliance"]
+                if c["critic_missing"]:
+                    codes.append("크리틱누락")
+                if c["approval_unlogged"]:
+                    codes.append("승인미기록")
+                if c["correction_loop_exceeded"]:
+                    codes.append("교정루프초과")
+                print(f"  ❌ {m['task'][:40]:<40} {', '.join(codes)}")
+            print()
+        if strict and offenders:
+            sys.exit(1)
         return
 
     task_name = args[0]
     metrics = build_metrics(base_dir, task_name)
     print_report(metrics)
     if not dry:
-        path = persist(base_dir, task_name, metrics)
-        print(f"[Saved] {path} 의 metrics 필드에 기록했고 log.md에 [METRICS] 항목을 추가했습니다.")
+        path, hist = persist(base_dir, task_name, metrics)
+        print_delta(hist)
+        print(f"[Saved] {path} — metrics 갱신, metrics_history {len(hist)}건 누적, log.md에 [METRICS] 추가.")
     else:
         print("[Dry Run] 파일에 기록하지 않았습니다.")
+
+    if strict and not metrics["compliance"]["ok"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
