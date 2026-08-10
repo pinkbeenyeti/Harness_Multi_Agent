@@ -14,36 +14,24 @@ import glob
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common_utils import parse_log_line
-
-# ---------------------------------------------------------------------------
-# 토큰 근사 계수
-#
-# 실제 토크나이저를 호출하지 않고 파일 내용만으로 추정한다. API 모드가 아닌
-# Agent(antigravity) 모드에서는 usage 값을 받을 수 없기 때문이다.
-# 한글은 토크나이저에서 글자당 1토큰을 넘는 경우가 흔하고, 코드/영문은
-# 대략 4글자당 1토큰이다. 절대값이 아니라 '어느 단계가 비싼가'의 비교용이다.
-# ---------------------------------------------------------------------------
-TOKENS_PER_HANGUL_CHAR = 1.15
-TOKENS_PER_ASCII_CHAR = 0.27
+# 토큰 근사와 분량 규칙은 common_utils가 단일 진실 원천이다.
+# 계측(여기)과 검증(validate_result.py)이 서로 다른 계수를 쓰면
+# "통과했는데 계측에선 초과"같은 모순이 생긴다.
+from common_utils import (
+    parse_log_line,
+    evaluate_limits,
+    load_validate_rules,
+    approx_tokens,
+    is_hangul,
+    TOKENS_PER_HANGUL_CHAR,
+    TOKENS_PER_ASCII_CHAR,
+)
 
 FENCE_RE = re.compile(r'^\s*```')
 
 # 교정 루프 상한: 최초 1회 + 교정 3회. 이를 넘으면 워커를 계속 돌리지 말고
 # 사용자에게 에스컬레이션해야 한다(실측 최악 사례: 워커 호출 24회 / 라운드트립 72회).
 MAX_WORKER_CALLS = 4
-
-
-def is_hangul(ch):
-    o = ord(ch)
-    return 0xAC00 <= o <= 0xD7A3 or 0x1100 <= o <= 0x11FF or 0x3130 <= o <= 0x318F
-
-
-def approx_tokens(text):
-    """한글/비한글을 구분해 토큰 수를 근사한다."""
-    hangul = sum(1 for ch in text if is_hangul(ch))
-    other = len(text) - hangul
-    return int(hangul * TOKENS_PER_HANGUL_CHAR + other * TOKENS_PER_ASCII_CHAR)
 
 
 def split_code_prose(text):
@@ -96,9 +84,19 @@ def classify(filename):
         return "worker"
     if name.startswith("brief"):
         return "brief"
+    if name.startswith("draft"):
+        # 문서 산출 태스크에서 워커가 쓰는 본문 초안. 이 태스크 유형에서는
+        # 이것이 실질 납품물이자 최대 토큰 소비원이다.
+        return "draft"
     if name in ("task.md", "context.md", "log.md") or name.startswith("design_spec") or name.startswith("change_spec"):
         return "orchestrator"
     return "other"
+
+
+# artifact_tokens 합계에 포함되는 버킷.
+# 예전에는 명명 규칙에 맞는 4종만 더해서, draft_*.md 같은 파일이 통째로
+# 투명해졌다(실측 1건에서 총계를 3.2배 과소보고). 이제 모든 버킷을 더한다.
+ARTIFACT_BUCKETS = ("brief", "worker", "critic", "draft", "orchestrator", "other")
 
 
 def collect_artifacts(task_dir):
@@ -202,7 +200,21 @@ def measure_fixed_overhead(base_dir):
 # (35개 태스크 중 17개가 크리틱 검증 기록 0건, 21개가 승인 기록 0건).
 # 여기서 로그를 근거로 위반을 적발한다.
 # ---------------------------------------------------------------------------
-def check_compliance(tags, groups=1):
+def check_brief_limits(task_dir):
+    """브리프 분량 상한 위반을 적발한다. 상한은 있었으나 강제되지 않아
+    실측에서 브리프가 워커 결과물의 2.7배까지 부푼 사례가 있었다."""
+    rules = load_validate_rules()
+    offenders = []
+    for path in sorted(glob.glob(os.path.join(task_dir, "brief*.md"))):
+        try:
+            r = evaluate_limits(path, rules)
+        except Exception:
+            continue
+        offenders.extend(r["violations"])
+    return offenders
+
+
+def check_compliance(tags, groups=1, brief_violations=None):
     """
     groups: 병렬 실행 그룹 수(= result*.md 개수). 워커를 파일 그룹별로 병렬
     기동하면 그룹 수만큼 호출이 늘어나는 것이 정상이므로, 교정 루프 상한도
@@ -232,6 +244,14 @@ def check_compliance(tags, groups=1):
             f"({call_limit}회, {detail})을 넘었습니다. "
             "교정을 반복하지 말고 사용자에게 에스컬레이션했어야 합니다.")
 
+    brief_violations = brief_violations or []
+    if brief_violations:
+        head = "; ".join(brief_violations[:3])
+        more = f" (외 {len(brief_violations) - 3}건)" if len(brief_violations) > 3 else ""
+        violations.append(
+            f"BRIEF_OVER_LIMIT: 브리프 {len(brief_violations)}건이 분량 상한을 초과했습니다 — {head}{more}. "
+            "브리프는 경로·라인 범위·지시만 담습니다.")
+
     return {
         "ok": not violations,
         "violations": violations,
@@ -240,6 +260,7 @@ def check_compliance(tags, groups=1):
         "critic_missing": worker_calls > 0 and verifications == 0,
         "approval_unlogged": worker_calls > 0 and approvals == 0,
         "correction_loop_exceeded": worker_calls > call_limit,
+        "brief_over_limit": bool(brief_violations),
     }
 
 
@@ -255,11 +276,16 @@ def build_metrics(base_dir, task_name):
     log_stats = analyze_log(parse_log(os.path.join(task_dir, "log.md")))
     overhead = measure_fixed_overhead(base_dir)
 
-    worker_tok = artifacts.get("worker", {}).get("total_tokens", 0)
-    critic_tok = artifacts.get("critic", {}).get("total_tokens", 0)
-    brief_tok = artifacts.get("brief", {}).get("total_tokens", 0)
-    orch_tok = artifacts.get("orchestrator", {}).get("total_tokens", 0)
-    artifact_tok = worker_tok + critic_tok + brief_tok + orch_tok
+    def bucket_tok(name):
+        return artifacts.get(name, {}).get("total_tokens", 0)
+
+    worker_tok = bucket_tok("worker")
+    critic_tok = bucket_tok("critic")
+    brief_tok = bucket_tok("brief")
+    draft_tok = bucket_tok("draft")
+    orch_tok = bucket_tok("orchestrator")
+    other_tok = bucket_tok("other")
+    artifact_tok = sum(bucket_tok(b) for b in ARTIFACT_BUCKETS)
 
     worker_code = artifacts.get("worker", {}).get("code_tokens", 0)
 
@@ -296,7 +322,9 @@ def build_metrics(base_dir, task_name):
             "brief": brief_tok,
             "worker_result": worker_tok,
             "critic_report": critic_tok,
+            "draft": draft_tok,
             "orchestrator_docs": orch_tok,
+            "other": other_tok,
             "total": artifact_tok,
         },
         "derived": {
@@ -309,7 +337,8 @@ def build_metrics(base_dir, task_name):
             "resident_overhead_cumulative": overhead.get("resident_tokens", 0) * max(log_stats["entries"], 1),
             "estimated_reconsumption_tokens": reconsumption,
         },
-        "compliance": check_compliance(tags, groups=parallel_groups),
+        "compliance": check_compliance(tags, groups=parallel_groups,
+                                       brief_violations=check_brief_limits(task_dir)),
         "fixed_overhead": overhead,
         "artifacts": {k: {"bytes": v["bytes"], "total_tokens": v["total_tokens"],
                           "code_tokens": v["code_tokens"], "prose_tokens": v["prose_tokens"],
@@ -432,9 +461,14 @@ def print_report(m):
 
     print("\n[산출물 토큰 (근사)]")
     for label, key in (("브리프", "brief"), ("워커 result", "worker_result"),
-                       ("크리틱 report", "critic_report"), ("오케스트레이터 문서", "orchestrator_docs")):
-        print(f"  {label:<20}: {a[key]:>8,}")
+                       ("크리틱 report", "critic_report"), ("초안 draft", "draft"),
+                       ("오케스트레이터 문서", "orchestrator_docs"), ("기타", "other")):
+        val = a.get(key, 0)
+        if val or key in ("brief", "worker_result", "critic_report"):
+            print(f"  {label:<20}: {val:>8,}")
     print(f"  {'합계':<20}: {a['total']:>8,}")
+    if a.get("draft"):
+        print(f"  → 초안이 전체의 {a['draft'] / a['total'] * 100:.1f}%. 문서 산출형 태스크는 diff 핸드오프가 통하지 않는다.")
 
     print("\n[판단 지표]")
     print(f"  result.md 코드블록 비중 : {d['worker_code_share_pct']}%   → B(diff 핸드오프) 효과 상한")
@@ -551,6 +585,8 @@ def main():
                     codes.append("승인미기록")
                 if c["correction_loop_exceeded"]:
                     codes.append("교정루프초과")
+                if c.get("brief_over_limit"):
+                    codes.append("브리프초과")
                 print(f"  ❌ {m['task'][:40]:<40} {', '.join(codes)}")
             print()
         if strict and offenders:

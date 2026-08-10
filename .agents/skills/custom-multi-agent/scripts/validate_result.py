@@ -11,47 +11,16 @@ if hasattr(sys.stdout, 'reconfigure'):
 import re
 import json
 
-def count_korean_characters(text):
-    # 한글 글자만 필터링하여 카운트
-    korean_chars = re.findall(r'[ㄱ-ㅎㅏ-ㅣ가-힣]', text)
-    return len(korean_chars)
-
-def count_english_words(text):
-    # 영어 단어 패턴 추출
-    words = re.findall(r'\b[a-zA-Z]+\b', text)
-    return len(words)
-
-_FENCE_RE = re.compile(r'^\s*```')
-
-def strip_code_blocks(text):
-    """
-    마크다운 코드펜스 내부를 제거한다.
-    result.md/critic_report.md는 코드(diff 포함)를 담는 것이 정상이므로,
-    산문 분량만 한도로 통제하고 코드는 별도의 바이트 한도로 통제한다.
-    """
-    out = []
-    in_code = False
-    for line in text.splitlines(keepends=True):
-        if _FENCE_RE.match(line):
-            in_code = not in_code
-            continue
-        if not in_code:
-            out.append(line)
-    return "".join(out)
-
-def resolve_rule_key(filename, rules):
-    """
-    result_v2.md, critic_report_fix2.md 처럼 접미사가 붙은 파일도
-    같은 규칙을 적용받도록 접두사 매칭을 지원한다.
-    """
-    if filename in rules:
-        return filename
-    stem = filename[:-3] if filename.endswith(".md") else filename
-    for key in rules:
-        key_stem = key[:-3] if key.endswith(".md") else key
-        if stem.startswith(key_stem):
-            return key
-    return None
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 카운트·규칙 해석은 common_utils가 단일 진실 원천이다.
+# call_worker.py(사전 검증)와 collect_metrics.py(준수 검사)가 같은 함수를 쓴다.
+from common_utils import (
+    count_korean_characters,
+    count_english_words,
+    strip_code_blocks,
+    resolve_rule_key,
+    approx_tokens,
+)
 
 def validate_file(task_name, file_path):
     if not os.path.exists(file_path):
@@ -88,20 +57,34 @@ def validate_file(task_name, file_path):
     counted = strip_code_blocks(content) if file_rules.get("exclude_code_blocks") else content
     korean_cnt = count_korean_characters(counted)
     english_cnt = count_english_words(counted)
+    token_cnt = approx_tokens(counted)
 
     print(f"=== Validation Report for '{filename}' in Task '{task_name}' ===")
     if rule_key and rule_key != filename:
         print(f"(Applying rule set of '{rule_key}')")
     print(f"Total Character Length: {total_len} ({total_bytes} bytes)")
     scope = " (code blocks excluded)" if file_rules.get("exclude_code_blocks") else ""
+    print(f"Approx Tokens: {token_cnt}{scope}")
     print(f"Korean Character Count: {korean_cnt}{scope}")
     print(f"English Word Count: {english_cnt}{scope}\n")
 
-    # 1) 글자수 및 영어 단어수 한도 검사 (validate_rules.json 기반)
+    # 1) 분량 한도 검사 (validate_rules.json 기반)
     if file_rules:
+        limit_tokens = file_rules.get("limit_tokens")
         limit_korean = file_rules.get("limit_korean")
         limit_english = file_rules.get("limit_english")
         limit_bytes = file_rules.get("limit_bytes")
+
+        if limit_tokens is not None:
+            if token_cnt > limit_tokens:
+                diff = token_cnt - limit_tokens
+                pct = (diff / limit_tokens) * 100
+                print(f"[FAIL] '{filename}' exceeds approximate token budget!")
+                print(f"       - Limit: {limit_tokens} tokens, Current: {token_cnt} tokens ({pct:.1f}% exceeded)")
+                print(f"       - Recommendation: 배경 설명·이전 라운드 요약·코드 본문을 덜어내 약 {diff}토큰 줄이십시오.")
+                is_valid = False
+            else:
+                print(f"[PASS] Approximate token budget within limit ({token_cnt}/{limit_tokens})")
 
         if limit_bytes is not None:
             if total_bytes > limit_bytes:

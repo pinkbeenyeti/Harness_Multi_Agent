@@ -14,7 +14,11 @@ import urllib.error
 import time
 import asyncio
 from datetime import datetime
-from common_utils import load_api_keys, load_backend_config as _shared_load_backend_config
+from common_utils import (
+    load_api_keys,
+    load_backend_config as _shared_load_backend_config,
+    evaluate_limits,
+)
 
 # 워커 응답의 출력 토큰 상한.
 # 이전에는 anthropic 경로에만 4000이 걸려 있었고, 상한에 닿아도 아무 신호 없이
@@ -376,6 +380,26 @@ def main():
         print(f"Error: Brief file not found at '{brief_path}'")
         sys.exit(1)
         
+    # 2.1 브리프 사전 검증 (기동 전 게이트)
+    #
+    # 브리프 상한은 규칙으로만 존재하고 강제되지 않아, 실측에서 브리프 11개가
+    # 20,140토큰(워커 결과물의 2.7배)까지 부풀었다. 브리프는 워커 프롬프트로
+    # 그대로 들어가므로 여기서 막는 것이 가장 싸다.
+    brief_check = evaluate_limits(brief_path)
+    if brief_check["violations"]:
+        print(f"[BRIEF OVER LIMIT] '{os.path.basename(brief_path)}'가 분량 상한을 초과했습니다. 워커를 기동하지 않습니다.")
+        for v in brief_check["violations"]:
+            print(f"  - {v}")
+        print("  → 브리프는 '경로 + 라인 범위 + 지시'만 담습니다. 코드 본문·배경 설명·이전 라운드 요약을 덜어내십시오.")
+
+        log_path_pre = os.path.join(task_dir, "log.md")
+        if os.path.exists(log_path_pre):
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+            with open(log_path_pre, "a", encoding="utf-8") as lf:
+                lf.write(f"\n{current_time} [ERROR] 브리프 '{os.path.basename(brief_path)}' 분량 상한 초과로 워커 기동을 차단했습니다. "
+                         + "; ".join(brief_check["violations"]))
+        sys.exit(4)
+
     with open(brief_path, "r", encoding="utf-8") as f:
         prompt = f.read()
     # worker_booster.md 로드 (system_prompt 용)

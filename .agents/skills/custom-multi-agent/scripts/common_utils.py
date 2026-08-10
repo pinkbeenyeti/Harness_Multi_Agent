@@ -45,6 +45,133 @@ def parse_log_line(line):
     return LOG_TAG_ALIASES.get(tag, tag), date, hhmm, text
 
 
+# ---------------------------------------------------------------------------
+# 분량 한도 검사 (공용)
+#
+# validate_result.py가 사후 검증에, call_worker.py가 워커 기동 전 사전 검증에,
+# collect_metrics.py가 준수 검사에 같은 규칙을 써야 한다. 각자 세면 규칙이
+# 어긋나므로 한 곳에 둔다.
+# ---------------------------------------------------------------------------
+_FENCE_RE = re.compile(r'^\s*```')
+
+# 토큰 근사 계수. 실제 토크나이저를 부르지 않고 파일 내용만으로 추정한다.
+# 한글은 글자당 1토큰을 넘는 경우가 흔하고, 코드/영문은 대략 4글자당 1토큰이다.
+TOKENS_PER_HANGUL_CHAR = 1.15
+TOKENS_PER_ASCII_CHAR = 0.27
+
+
+def is_hangul(ch):
+    o = ord(ch)
+    return 0xAC00 <= o <= 0xD7A3 or 0x1100 <= o <= 0x11FF or 0x3130 <= o <= 0x318F
+
+
+def approx_tokens(text):
+    """한글/비한글을 구분해 토큰 수를 근사한다."""
+    hangul = sum(1 for ch in text if is_hangul(ch))
+    other = len(text) - hangul
+    return int(hangul * TOKENS_PER_HANGUL_CHAR + other * TOKENS_PER_ASCII_CHAR)
+
+
+def count_korean_characters(text):
+    return len(re.findall(r'[ㄱ-ㅎㅏ-ㅣ가-힣]', text))
+
+
+def count_english_words(text):
+    return len(re.findall(r'\b[a-zA-Z]+\b', text))
+
+
+def strip_code_blocks(text):
+    """마크다운 코드펜스 내부를 제거한다."""
+    out = []
+    in_code = False
+    for line in text.splitlines(keepends=True):
+        if _FENCE_RE.match(line):
+            in_code = not in_code
+            continue
+        if not in_code:
+            out.append(line)
+    return "".join(out)
+
+
+def load_validate_rules():
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    rules_path = os.path.join(base_dir, "validate_rules.json")
+    if not os.path.exists(rules_path):
+        return {}
+    try:
+        with open(rules_path, "r", encoding="utf-8") as f:
+            return json.load(f).get("rules", {})
+    except Exception:
+        return {}
+
+
+def resolve_rule_key(filename, rules):
+    """
+    result_core.md, brief_fix_steps.md 처럼 접미사가 붙은 파일도 같은 규칙을
+    적용받도록 접두사 매칭을 지원한다. 가장 긴(구체적인) 키를 우선한다.
+    """
+    if filename in rules:
+        return filename
+    stem = filename[:-3] if filename.endswith(".md") else filename
+    best = None
+    for key in rules:
+        key_stem = key[:-3] if key.endswith(".md") else key
+        if stem.startswith(key_stem) and (best is None or len(key_stem) > len(best[1])):
+            best = (key, key_stem)
+    return best[0] if best else None
+
+
+def evaluate_limits(file_path, rules=None):
+    """
+    파일 하나의 분량 한도 위반을 평가한다.
+    반환: {"rule_key", "violations": [문자열...], "korean", "english", "bytes"}
+    규칙이 없으면 violations는 빈 리스트다.
+    """
+    rules = load_validate_rules() if rules is None else rules
+    filename = os.path.basename(file_path)
+    rule_key = resolve_rule_key(filename, rules)
+    file_rules = rules.get(rule_key, {}) if rule_key else {}
+
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+
+    total_bytes = len(content.encode("utf-8"))
+    counted = strip_code_blocks(content) if file_rules.get("exclude_code_blocks") else content
+    korean = count_korean_characters(counted)
+    english = count_english_words(counted)
+
+    tokens = approx_tokens(counted)
+
+    violations = []
+    lim_b = file_rules.get("limit_bytes")
+    lim_t = file_rules.get("limit_tokens")
+    lim_k = file_rules.get("limit_korean")
+    lim_e = file_rules.get("limit_english")
+
+    if lim_b is not None and total_bytes > lim_b:
+        violations.append(f"{filename}: {total_bytes} bytes > 상한 {lim_b}")
+    # limit_tokens가 주 통제 수단이다. 한글/영어를 따로 AND로 걸면 언어에 따라
+    # 한쪽만 터지는 비대칭이 생긴다(영어로 쓴 브리프는 영단어 한도에서 즉사).
+    # 언어와 무관한 단일 예산으로 통제한다.
+    if lim_t is not None and tokens > lim_t:
+        violations.append(f"{filename}: 근사 {tokens}토큰 > 상한 {lim_t}토큰")
+    if lim_k is not None and korean > lim_k:
+        violations.append(f"{filename}: 한글 {korean}자 > 상한 {lim_k}자")
+    if lim_e is not None and english > lim_e:
+        violations.append(f"{filename}: 영단어 {english}개 > 상한 {lim_e}개")
+
+    return {
+        "rule_key": rule_key,
+        "violations": violations,
+        "korean": korean,
+        "english": english,
+        "tokens": tokens,
+        "bytes": total_bytes,
+        "exclude_code_blocks": bool(file_rules.get("exclude_code_blocks")),
+        "rules": file_rules,
+    }
+
+
 def load_backend_config(role):
     """
     backends.json에서 워커 역할(role)에 대응하는 provider/model 설정을 읽어온다.
