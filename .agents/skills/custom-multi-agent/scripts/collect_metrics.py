@@ -25,6 +25,7 @@ from common_utils import (
     is_hangul,
     TOKENS_PER_HANGUL_CHAR,
     TOKENS_PER_ASCII_CHAR,
+    archive_stale_log_entries,
 )
 
 FENCE_RE = re.compile(r'^\s*```')
@@ -214,7 +215,7 @@ def check_brief_limits(task_dir):
     return offenders
 
 
-def check_compliance(tags, groups=1, brief_violations=None):
+def check_compliance(tags, groups=1, brief_violations=None, brief_tok=0, worker_tok=0):
     """
     groups: 병렬 실행 그룹 수(= result*.md 개수). 워커를 파일 그룹별로 병렬
     기동하면 그룹 수만큼 호출이 늘어나는 것이 정상이므로, 교정 루프 상한도
@@ -229,6 +230,10 @@ def check_compliance(tags, groups=1, brief_violations=None):
     approvals = tags.get("APPROVAL", 0)
 
     violations = []
+    if worker_tok > 0 and brief_tok / worker_tok > 2.0:
+        violations.append(
+            f"BRIEF_RESULT_RATIO_EXCEEDED: 브리프({brief_tok}토큰)가 워커 결과물({worker_tok}토큰)의 "
+            f"{brief_tok/worker_tok:.1f}배입니다. 브리프에 배경 설명·이전 라운드 요약이 섞여있지 않은지 확인하십시오.")
     if worker_calls > 0 and verifications == 0:
         violations.append(
             "CRITIC_MISSING: 워커가 실행됐으나 비평 워커 검증 기록이 0건입니다. "
@@ -261,6 +266,7 @@ def check_compliance(tags, groups=1, brief_violations=None):
         "approval_unlogged": worker_calls > 0 and approvals == 0,
         "correction_loop_exceeded": worker_calls > call_limit,
         "brief_over_limit": bool(brief_violations),
+        "brief_result_ratio_exceeded": worker_tok > 0 and brief_tok / worker_tok > 2.0,
     }
 
 
@@ -338,7 +344,8 @@ def build_metrics(base_dir, task_name):
             "estimated_reconsumption_tokens": reconsumption,
         },
         "compliance": check_compliance(tags, groups=parallel_groups,
-                                       brief_violations=check_brief_limits(task_dir)),
+                                       brief_violations=check_brief_limits(task_dir),
+                                       brief_tok=brief_tok, worker_tok=worker_tok),
         "fixed_overhead": overhead,
         "artifacts": {k: {"bytes": v["bytes"], "total_tokens": v["total_tokens"],
                           "code_tokens": v["code_tokens"], "prose_tokens": v["prose_tokens"],
@@ -587,6 +594,8 @@ def main():
                     codes.append("교정루프초과")
                 if c.get("brief_over_limit"):
                     codes.append("브리프초과")
+                if c.get("brief_result_ratio_exceeded"):
+                    codes.append("브리프비율초과")
                 print(f"  ❌ {m['task'][:40]:<40} {', '.join(codes)}")
             print()
         if strict and offenders:
@@ -600,6 +609,16 @@ def main():
         path, hist = persist(base_dir, task_name, metrics)
         print_delta(hist)
         print(f"[Saved] {path} — metrics 갱신, metrics_history {len(hist)}건 누적, log.md에 [METRICS] 추가.")
+
+        task_dir = os.path.join(base_dir, "tasks", task_name)
+        task_md_path = os.path.join(task_dir, "task.md")
+        if os.path.exists(task_md_path):
+            with open(task_md_path, "r", encoding="utf-8", errors="replace") as f:
+                task_md_content = f.read()
+            if "**Status**: done" in task_md_content:
+                archive_result = archive_stale_log_entries(os.path.join(task_dir, "log.md"))
+                if archive_result["archived_rounds"] > 0:
+                    print(f"[Archive] {archive_result['archived_rounds']}개 라운드를 log_archive.md로 이동.")
     else:
         print("[Dry Run] 파일에 기록하지 않았습니다.")
 

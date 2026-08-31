@@ -121,6 +121,72 @@ def resolve_rule_key(filename, rules):
     return best[0] if best else None
 
 
+def archive_stale_log_entries(log_path, keep_recent_rounds=2):
+    """
+    log.md가 계속 커지는 것을 막기 위해, WORKER_CALL 기준 라운드 중 최근
+    keep_recent_rounds개를 제외한 나머지를 log_archive.md로 옮기고 원본에는
+    요약 한 줄만 남긴다. parse_log_line/정규식/태그 별칭은 재사용만 한다.
+    """
+    if not os.path.exists(log_path):
+        return {"archived_rounds": 0}
+
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+
+    preamble = []       # 첫 WORKER_CALL 이전: 항상 보존
+    rounds = []          # [{"entries": [{"date": str, "raw": [line, ...]}, ...]}]
+    cur_entries = None   # 현재 라운드의 entries. None이면 아직 라운드 시작 전
+
+    for line in lines:
+        parsed = parse_log_line(line.rstrip("\n"))
+        if parsed is None:
+            # 연속(들여쓰기) 줄은 직전 항목에 붙인다.
+            if cur_entries:
+                cur_entries[-1]["raw"].append(line)
+            else:
+                preamble.append(line)
+            continue
+        tag, date, hhmm, text = parsed
+        if tag == "WORKER_CALL":
+            cur_entries = []
+            rounds.append({"entries": cur_entries})
+        if cur_entries is None:
+            preamble.append(line)
+        else:
+            cur_entries.append({"date": date, "raw": [line]})
+
+    if len(rounds) <= keep_recent_rounds:
+        return {"archived_rounds": 0}
+
+    n_archive = len(rounds) - keep_recent_rounds
+    archived, kept = rounds[:n_archive], rounds[n_archive:]
+
+    archive_path = os.path.join(os.path.dirname(log_path), "log_archive.md")
+    need_header = not os.path.exists(archive_path)
+    with open(archive_path, "a", encoding="utf-8") as af:
+        if need_header:
+            af.write("# Archived Log Entries (Append-Only)\n\n")
+        for rnd in archived:
+            for e in rnd["entries"]:
+                af.writelines(e["raw"])
+
+    new_lines = list(preamble)
+    for rnd in archived:
+        dates = [e["date"] for e in rnd["entries"]]
+        first_date, last_date = min(dates), max(dates)
+        new_lines.append(
+            f"[ARCHIVED] {first_date}~{last_date} 라운드 {len(rnd['entries'])}건 "
+            f"— 상세는 log_archive.md 참조\n")
+    for rnd in kept:
+        for e in rnd["entries"]:
+            new_lines.extend(e["raw"])
+
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+    return {"archived_rounds": n_archive}
+
+
 def evaluate_limits(file_path, rules=None):
     """
     파일 하나의 분량 한도 위반을 평가한다.
