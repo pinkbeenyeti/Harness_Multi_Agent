@@ -45,19 +45,12 @@ def init_task(task_name):
         with open(log_out_path, "w", encoding="utf-8") as f:
             f.write(content)
             
-    # 4. cost_tracker.json 생성
+    # 4. cost_tracker.json 생성 (템플릿 파일 복사 — 스키마 이중관리 제거)
+    cost_tpl_path = os.path.join(templates_dir, "cost_tracker_template.json")
     cost_tracker_path = os.path.join(target_task_dir, "cost_tracker.json")
-    import json
-    default_cost_data = {
-        "budget_limit": 2.0,
-        "accumulated_cost": 0.0,
-        "fallback_role": "gemini",
-        "worker_mode": "multi-api",  # "multi-api", "gemini-only", "antigravity"
-        "history": []
-    }
-    with open(cost_tracker_path, "w", encoding="utf-8") as f:
-        json.dump(default_cost_data, f, indent=2, ensure_ascii=False)
-            
+    if os.path.exists(cost_tpl_path):
+        shutil.copy(cost_tpl_path, cost_tracker_path)
+
     print(f"Successfully initialized multi-agent task '{task_name}' at {target_task_dir}")
 
 if __name__ == "__main__":
@@ -70,5 +63,12 @@ if __name__ == "__main__":
         check_for_updates()
     except Exception as e:
         print(f"[Warning] Failed to import or run check_for_updates: {e}")
+
+    from common_utils import validate_task_name
+    try:
+        validate_task_name(sys.argv[1])
+    except ValueError as e:
+        print(f"[SECURITY] {e}")
+        sys.exit(1)
 
     init_task(sys.argv[1])

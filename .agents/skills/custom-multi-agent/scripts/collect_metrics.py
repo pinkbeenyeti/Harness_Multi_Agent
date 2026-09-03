@@ -565,6 +565,14 @@ def main():
         print("  --strict : 규칙 위반이 있으면 exit code 1로 종료한다 (태스크 완료 시 권장)")
         sys.exit(1)
 
+    from common_utils import validate_task_name
+    if args[0] != "--all":
+        try:
+            validate_task_name(args[0])
+        except ValueError as e:
+            print(f"[SECURITY] {e}")
+            sys.exit(1)
+
     if args[0] == "--all":
         names = sorted(d for d in os.listdir(tasks_dir)
                        if os.path.isdir(os.path.join(tasks_dir, d)))

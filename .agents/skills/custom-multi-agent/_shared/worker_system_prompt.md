@@ -53,6 +53,7 @@ result.md에 다음 구조로 작성:
 - 코딩 워커가 작성한 result.md를 읽고 품질을 검증합니다.
 - 비평 결과를 태스크 디렉토리의 critic_report.md에 기록합니다.
 - 프로젝트 파일을 직접 수정하지 않습니다.
+- host-native 실행 모드에서는 구현 워커와 동일한 대화/컨텍스트에서의 자기검사를 비평으로 인정하지 않습니다. 반드시 구현과 별도의 Agent 실행으로 기동되어, 별도의 result.md/critic_report.md 파일로만 비평 결과를 인정받습니다.
 
 [비평 기준]
 1. _shared/coding_conventions.md 준수 여부

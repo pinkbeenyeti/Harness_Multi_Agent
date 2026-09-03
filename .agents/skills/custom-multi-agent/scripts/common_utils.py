@@ -238,23 +238,79 @@ def evaluate_limits(file_path, rules=None):
     }
 
 
-def load_backend_config(role):
-    """
-    backends.json에서 워커 역할(role)에 대응하는 provider/model 설정을 읽어온다.
-    call_worker.py와 knot_manager.py가 이 함수를 공유하여, 모델명이 각 스크립트에
-    개별적으로 하드코딩되어 backends.json 설정과 어긋나는 드리프트를 방지한다.
-    """
+def _load_backends_json():
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    config_path = os.path.join(base_dir, "backends.json")
+    with open(os.path.join(base_dir, "backends.json"), "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
 
-    workers = config.get("workers", {})
-    if role not in workers:
+def load_backend_config(role, execution_mode="api-routed"):
+    """
+    backends.json에서 워커 역할(role)×execution_mode(api-routed/cli-routed/host-native)에
+    대응하는 provider/model(또는 cli/model) 설정을 읽어온다. call_worker.py와
+    knot_manager.py가 이 함수를 공유하여, 모델명이 각 스크립트에 개별적으로
+    하드코딩되어 backends.json 설정과 어긋나는 드리프트를 방지한다.
+    """
+    config = _load_backends_json()
+    role = resolve_legacy_role(role, config)
+    roles = config.get("roles", {})
+    if role not in roles:
         raise KeyError(f"Role '{role}' is not defined in backends.json")
+    routes = roles[role].get("routes", {})
+    if execution_mode not in routes:
+        raise KeyError(f"Role '{role}' has no route for execution_mode '{execution_mode}'")
+    return routes[execution_mode]
 
-    return workers[role]
+
+def resolve_legacy_role(role, config):
+    """구 역할명(claude-main 등)을 backends.json의 legacy_role_aliases로 신 역할명에 매핑한다."""
+    if role in config.get("roles", {}):
+        return role
+    return config.get("legacy_role_aliases", {}).get(role, role)
+
+
+_LEGACY_MODE_MAP = {"multi-api": "api-routed", "gemini-only": "api-routed", "antigravity": "host-native"}
+
+
+def resolve_execution_mode(cost_data):
+    """
+    cost_tracker.json의 execution_mode(신규 스키마) 또는 worker_mode(레거시)를 읽어
+    (execution_mode, google_only, warn_message) 튜플로 반환한다. 레거시 파일 자체는
+    수정하지 않고, 읽는 시점에만 인메모리로 별칭을 해석한다.
+    """
+    if "execution_mode" in cost_data:
+        return cost_data["execution_mode"], False, None
+    wm = cost_data.get("worker_mode", "multi-api")
+    mode = _LEGACY_MODE_MAP.get(wm, "api-routed")
+    warn = f"[WARN] worker_mode='{wm}' -> execution_mode='{mode}'(별칭, 원본 미변경)." if wm == "antigravity" else None
+    return mode, wm == "gemini-only", warn
+
+
+_TASK_NAME_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def validate_task_name(task_name):
+    """task_name으로 경로를 구성하기 전에 경로 이탈(.., 절대경로, 구분자 등)을 차단한다."""
+    if not task_name or not _TASK_NAME_RE.match(task_name):
+        raise ValueError(f"Invalid task_name '{task_name}': 영숫자/-/_ 만 허용")
+    return task_name
+
+
+def cli_allowlist_check(cli_name, argv):
+    """
+    cli-routed 서브프로세스 실행 전 argv를 backends.json의 cli_allowlist와 대조한다.
+    자유 텍스트(프롬프트)를 argv에 추가하기 전에 호출해야 한다 — 그 뒤에 검사하면
+    코드블록·특수문자가 포함된 정상 프롬프트까지 metachar 스캔에 걸려 차단된다.
+    """
+    entry = _load_backends_json().get("cli_allowlist", {}).get(cli_name)
+    if not entry:
+        raise ValueError(f"CLI '{cli_name}' not in cli_allowlist")
+    if not isinstance(argv, list) or not argv or argv[0] != entry["binary"]:
+        raise ValueError(f"argv[0] mismatch: {argv}")
+    for tok in argv:
+        if not isinstance(tok, str) or any(c in tok for c in ";&|`$><\n"):
+            raise ValueError(f"shell metachar in argv: {tok!r}")
+    return True
 
 
 def load_api_keys():

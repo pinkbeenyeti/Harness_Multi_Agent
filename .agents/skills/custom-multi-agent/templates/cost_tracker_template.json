@@ -1,7 +1,9 @@
 {
   "budget_limit": 2.0,
-  "accumulated_cost": 0.0,
-  "fallback_role": "gemini",
-  "worker_mode": "multi-api",
-  "history": []
+  "execution_mode": "api-routed",
+  "usd_cost": {"accumulated": 0.0, "reserved": 0.0, "history": []},
+  "cli_quota": {"history": []},
+  "fallback_role": "fallback-efficient",
+  "route_history": [],
+  "metrics_history": []
 }

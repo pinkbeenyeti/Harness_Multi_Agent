@@ -53,9 +53,9 @@ def call_llm_for_wiki(body, filename):
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if gemini_key:
         try:
-            gemini_model = _resolve_wiki_model("gemini-critic", "gemini")
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
-            headers = {"Content-Type": "application/json"}
+            gemini_model = _resolve_wiki_model("critic-standard", "gemini")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
+            headers = {"Content-Type": "application/json", "x-goog-api-key": gemini_key}
             prompt = get_wiki_prompt(body, filename)
             data = {"contents": [{"parts": [{"text": prompt}]}]}
             req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")

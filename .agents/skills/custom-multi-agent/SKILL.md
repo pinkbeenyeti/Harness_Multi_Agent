@@ -95,7 +95,7 @@ Tier가 허용한 병합 외에 단계를 임의로 합치지 않는다. 사용�
 - **병합**: 모든 그룹이 비평을 통과한 뒤 **한 번에** 반영한다. 그룹 단위 부분 병합은 중간 상태에서 컴파일이 깨질 수 있으므로 금지한다.
 - **상한**: 교정 루프 상한은 그룹당 4회로 계산된다(`collect_metrics.py`가 `result*.md` 개수로 자동 환산).
 - 그룹이 1개로 나온다면 병렬화하지 않는다. 억지로 쪼개는 것이 가장 흔한 실패다.
-- 실행 모드·예산·antigravity 상세는 `_shared/antigravity_guide.md` 참조.
+- execution_mode(api-routed/cli-routed/host-native)·예산 상세는 `_shared/antigravity_guide.md` 참조.
 
 ### 1.4 완료 처리
 
@@ -159,6 +159,6 @@ antigravity 모드에서는 이것이 **유일한** 비용·소요시간 기록 
 | 새 작업 초기화 | `python scripts/init_task.py <task-name>` |
 | 결과 검증 (분량·문법·크리틱 존재) | `python scripts/validate_result.py <task-name> <file>` |
 | **비용·소요시간 계측** | `python scripts/collect_metrics.py <task-name>` / `--all` / `--dry` |
-| 이종 API 워커 실행 | `python scripts/call_worker.py <role> <brief> <result>` |
+| 역할별 워커 실행 (execution_mode 자동 분기, host-native는 exit 5) | `python scripts/call_worker.py <role> <brief> <result>` |
 | 실시간 상태 모니터링 | `python scripts/monitor_task.py <task-name>` |
 | 지식 그물 관리 | `python scripts/knot_manager.py <save\|ingest\|lint> [args]` |
