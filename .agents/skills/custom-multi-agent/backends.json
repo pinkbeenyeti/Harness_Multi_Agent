@@ -17,21 +17,21 @@
     "critic-standard": {
       "routes": {
         "api-routed": {"provider": "google", "model": "gemini-3.5-flash", "input_price_per_1m": 0.15, "output_price_per_1m": 0.60},
-        "cli-routed": {"cli": "gemini", "model": "gemini-3.5-flash"},
+        "cli-routed": {"cli": "agy", "model": "gemini-3.8-flash-medium"},
         "host-native": {}
       }
     },
     "critic-architecture": {
       "routes": {
         "api-routed": {"provider": "google", "model": "gemini-3.1-pro", "input_price_per_1m": 7.0, "output_price_per_1m": 21.0},
-        "cli-routed": {"cli": "gemini", "model": "gemini-3.1-pro"},
+        "cli-routed": {"cli": "agy", "model": "gemini-3.1-pro-high"},
         "host-native": {}
       }
     },
     "fallback-efficient": {
       "routes": {
         "api-routed": {"provider": "google", "model": "gemini-3.5-flash", "input_price_per_1m": 0.15, "output_price_per_1m": 0.60},
-        "cli-routed": {"cli": "gemini", "model": "gemini-3.5-flash"},
+        "cli-routed": {"cli": "agy", "model": "gemini-3.8-flash-medium"},
         "host-native": {}
       }
     }
@@ -45,6 +45,6 @@
   "cli_allowlist": {
     "claude": {"binary": "claude", "args": ["-p", "--output-format", "json", "--permission-mode", "plan", "--disallowedTools", "Write,Edit,Bash,NotebookEdit", "--model"]},
     "codex": {"binary": "codex", "args": ["exec", "-s", "read-only", "--json", "-m"]},
-    "gemini": {"binary": "gemini", "args": ["--approval-mode", "plan", "-o", "json", "-m"]}
+    "agy": {"binary": "agy", "args": ["--sandbox", "--mode", "plan", "--output-format", "json", "--model"]}
   }
 }

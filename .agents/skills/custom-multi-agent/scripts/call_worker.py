@@ -3,6 +3,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import json
 import subprocess
+import shutil
 
 # Windows cp949 인코딩 크래시 방지
 if hasattr(sys.stdout, 'reconfigure'):
@@ -209,16 +210,28 @@ def call_worker_cli(cli_name, model, prompt, allowlist, effort=None, system_prom
         print(f"[WARN] {cli_name} effort 미확인(§0), 무시")
     cli_allowlist_check(cli_name, argv)  # 자유 텍스트(프롬프트) 추가 전에 검증
     composed = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{prompt}" if system_prompt else prompt
-    if cli_name == "gemini":
-        # 실측(gemini --help): -p는 프롬프트를 인자 값으로 받는다(stdin은 부가 입력일 뿐,
+    if cli_name == "agy":
+        # 실측(agy --help): -p는 프롬프트를 인자 값으로 받는다(stdin은 부가 입력일 뿐,
         # 대체 아님). 빈 stdin을 넘겨 자식 프로세스가 터미널 stdin 대기로 멈추지 않게 한다.
         argv = argv + ["-p", composed]
         stdin_input = ""
     else:
         stdin_input = composed
-    proc = subprocess.run(argv, input=stdin_input, capture_output=True, text=True, timeout=600)
+    # Windows에서는 npm 전역 CLI가 확장자 없는 이름(예: "claude")으로 PATH에 없고
+    # claude.cmd로만 존재한다. subprocess.run은 shell=True 없이는 PATHEXT를 뒤지지
+    # 않아 WinError 2로 즉시 실패한다. cli_allowlist_check는 이미 원본 argv(확장자
+    # 없는 이름)로 통과했으므로, 여기서 실행 직전에만 shutil.which로 실제 경로를
+    # 찾아 치환한다(셸 호출 아님, PATH 검색만 수행 — 인젝션 위험 없음).
+    resolved_bin = shutil.which(argv[0]) or argv[0]
+    argv = [resolved_bin] + argv[1:]
+    # text=True만 쓰면 Windows에서 로케일 기본 코드페이지(이 환경은 cp949)로
+    # 자식 프로세스 stdin/stdout을 인코딩/디코딩한다. 브리프의 em-dash(—) 등
+    # cp949로 표현 불가능한 문자가 있으면 UnicodeEncodeError로 즉시 실패한다.
+    # encoding="utf-8"을 명시해 시스템 로케일과 무관하게 항상 UTF-8을 쓴다.
+    proc = subprocess.run(argv, input=stdin_input, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=600)
     out, code = proc.stdout, proc.returncode
-    key = {"claude": "result", "gemini": "response"}.get(cli_name)
+    key = {"claude": "result", "agy": "response"}.get(cli_name)
     if key:
         try:
             out = json.loads(out).get(key, out)

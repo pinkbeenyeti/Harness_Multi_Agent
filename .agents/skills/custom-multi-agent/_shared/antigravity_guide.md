@@ -7,7 +7,7 @@
 | 값 | 의미 | 호출 경로 | 회계 |
 |---|---|---|---|
 | `api-routed` (기본) | `backends.json`의 역할별 이종 API 워커를 `call_worker.py`로 호출 | `call_anthropic`/`call_openai`/`call_google`(헤더 인증) | `usd_cost`: 호출 직전 worst-case reserve → 실비용 정산 |
-| `cli-routed` | 로컬 CLI(`claude`/`codex`/`gemini`)를 비대화형 모드로 서브프로세스 실행 | allowlist 통과 argv만 `subprocess.run`(`shell=True` 금지) | `cli_quota.history`: `{timestamp, cli, role, model, exit_code}` — **USD 필드 없음** |
+| `cli-routed` | 로컬 CLI(`claude`/`codex`/`agy`)를 비대화형 모드로 서브프로세스 실행 | allowlist 통과 argv만 `subprocess.run`(`shell=True` 금지) | `cli_quota.history`: `{timestamp, cli, role, model, exit_code}` — **USD 필드 없음** |
 | `host-native` | Antigravity SDK로 플랫폼 서브에이전트 구동(무료 쿼터) 또는 SDK 부재 시 오케스트레이터 위임 | 판단 기준 아래 참조 | 구독 쿼터 소모. `collect_metrics.py`로 수동 기록 |
 
 **`usd_cost`와 `cli_quota`는 어떤 합계·비교 로직에서도 더하지 않는다.** CLI/host-native 사용량을 `$0`이나 "무료"로 표시하지 않는다 — API 비용은 안 들지만 구독 쿼터를 실제로 소비한다.
@@ -20,6 +20,10 @@
   - **임포트 불가능**(예: 이 스킬처럼 Claude Code가 오케스트레이터인 세션): **exit code 5**로 종료하고 "call_worker.py로 처리 불가. 오케스트레이터가 Agent 도구로 별도 서브에이전트를 기동해 `result.md`/`critic_report.md`를 직접 작성해야 함"이라는 안내만 출력한다.
 - 이 판단은 워커를 실제로 불러본 뒤가 아니라 **브리프 작성 단계에서 오케스트레이터가 미리 알고 있어야 한다** — 지금 이 문서를 읽는 시점이 그 시점이다. Claude Code 세션에서 host-native 역할을 브리프하려면 애초에 `call_worker.py`를 거치지 말고 Agent 도구로 직접 서브에이전트를 기동한다.
 - **host-native 비평의 격리 요건**: 구현과 동일한 대화/컨텍스트에서의 자기검사는 유효한 비평으로 인정하지 않는다. 반드시 별도 Agent 실행 + 별도 `result_<그룹>.md`/`critic_report_<그룹>.md` 산출물이어야 한다(`_shared/worker_system_prompt.md` 비평 워커 프롬프트 참조).
+
+### `agy` CLI(cli-routed) vs `google.antigravity` SDK(host-native) — 별개 컴포넌트
+
+`agy`는 PATH에 설치된 독립 실행 파일(`agy.exe`/`agy`, Antigravity CLI)이며 `cli-routed` 모드에서 `subprocess.run`으로 호출하는 대상이다. 이는 `call_antigravity_sdk()`가 임포트를 시도하는 `google.antigravity` **Python SDK**(host-native 전용, Antigravity 앱 내부에서만 임포트 가능)와는 **서로 다른 컴포넌트**다. SDK는 이 Claude Code 세션에서 여전히 임포트 불가로 exit code 5로 막히지만, `agy` CLI는 이 세션에서 실측으로 인증·호출이 확인됐다(`agy models`로 원격 인증 상태 조회 성공, `agy --model ... --mode plan --output-format json -p "..."`로 실제 응답 수신 성공). **"Antigravity를 쓴다"는 말이 곧 host-native를 의미하지 않는다** — `cli-routed`로 `agy` CLI를 호출하는 것도 Antigravity를 활용하는 방법이며, `backends.json`의 `critic-standard`/`critic-architecture`/`fallback-efficient` cli-routed route가 정확히 이 방식(`"cli": "agy"`)을 쓴다.
 
 ## 레거시 `worker_mode` 필드 (읽기 전용 별칭)
 
