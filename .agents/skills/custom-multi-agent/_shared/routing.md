@@ -39,18 +39,20 @@ Tier 2는 위험도에 따라 **일반**과 **고위험**으로 다시 나뉜다
 
   | 역할 | 모델 | effort |
   |---|---|---|
-  | `planner` | GPT-5.6 Sol | high |
-  | `implementer` | Claude Sonnet 5 | high |
-  | `critic-architecture` | Gemini 3.1 Pro | medium~high |
+  | `planner` | GPT-5.6 Sol | medium |
+  | `implementer` | Claude Sonnet 5 | medium |
+  | `critic-architecture` | Gemini 3.1 Pro | medium |
 
 ### 2-B. Tier 2 고위험
 
   | 역할 | 모델 | effort |
   |---|---|---|
-  | `planner` | GPT-5.6 Sol | xhigh |
-  | `critic-standard` (계획비평) | Gemini Flash | high |
-  | `implementer` | Claude Sonnet 5 | high |
-  | `critic-architecture` (구조비평) | Gemini 3.1 Pro | high |
+  | `planner` | GPT-5.6 Sol | high |
+  | `critic-standard` (계획비평) | Gemini Flash | medium |
+  | `implementer` | Claude Sonnet 5 | medium |
+  | `critic-architecture` (구조비평) | Gemini 3.1 Pro | medium |
+
+* **effort 하향 근거(2026-09-04)**: cli-routed 워커 1회 호출이 7~10분씩 걸려 `call_worker.py`의 10분 서브프로세스 타임아웃에 위험하게 근접하는 문제가 실측됐다. 기존 표(일반=high, 고위험=xhigh/high)에서 한 단계씩 낮춰 지연을 줄인다. 품질 저하가 실제로 감지되면(critic 반려율 상승 등) 개별 역할만 다시 올린다.
 
 * **1단계 (계획 및 설계)**: 오케스트레이터가 직접 기획하거나 마일스톤을 확정하지 않는다. 오케스트레이터는 브리프를 작성하고 사용자 승인을 받은 뒤 **`planner` 워커**를 기동한다. `planner` 역할은 코드 수정 전 `structural-sop` 관점을 반영하여 본질적 병목과 위험을 선제 검증하고, **요구사항 분석·개선 로드맵·마일스톤 분할·`design_spec.md` 초안**을 작성한다(일반=high, 고위험=xhigh). **고위험은 추가로** `critic-standard`(Gemini Flash, high)가 구현 착수 전 계획 자체를 비평(계획비평)한다. 사용자 승인 없이는 다음 단계(구현)로 넘어가지 않는다.
 * **2단계 (구현 및 비평)**: `implementer`(Claude Sonnet 5, high)가 구현을 수령한 뒤, `critic-architecture`(Gemini 3.1 Pro)를 연속 가동해 구조 교차비평(Cross-Review)을 강제한다. 이종 모델 교차가 Tier 2의 핵심 안전장치다.
@@ -66,7 +68,7 @@ Tier 2는 위험도에 따라 **일반**과 **고위험**으로 다시 나뉜다
 |---|---|---|---|---|
 | 0 | — | — | — | — |
 | 1 | — | Sonnet5 (medium) | Gemini Flash (medium) | — |
-| 2 일반 | Sol (high) | Sonnet5 (high) | — | Gemini 3.1 Pro (medium~high) |
-| 2 고위험 | Sol (xhigh) | Sonnet5 (high) | Gemini Flash (high, 계획비평) | Gemini 3.1 Pro (high) |
+| 2 일반 | Sol (medium) | Sonnet5 (medium) | — | Gemini 3.1 Pro (medium) |
+| 2 고위험 | Sol (high) | Sonnet5 (medium) | Gemini Flash (medium, 계획비평) | Gemini 3.1 Pro (medium) |
 
 `execution_mode`가 `host-native`이면 위 모델 지정 대신 오케스트레이터가 Agent 도구로 별도 서브에이전트를 기동하고 구독 쿼터를 소비한다(USD $0이 아니다 — `cli_quota`/쿼터 소모로 별도 기록). `cost_tracker.json` 자동 계측이 `api-routed`처럼 동작하지 않으므로 완료 시 `collect_metrics.py`를 반드시 실행한다. 상세는 `_shared/antigravity_guide.md` 참조.

@@ -362,9 +362,11 @@ def call_worker_cli(cli_name, *, model, effort, prompt, allowlist, system_prompt
     # 자식 프로세스 stdin/stdout을 인코딩/디코딩한다. 브리프의 em-dash(—) 등
     # cp949로 표현 불가능한 문자가 있으면 UnicodeEncodeError로 즉시 실패한다.
     # encoding="utf-8"을 명시해 시스템 로케일과 무관하게 항상 UTF-8을 쓴다.
+    # 실측: Tier2 high/xhigh effort 호출이 7~10분씩 걸려 기존 600초 상한에 위험하게
+    # 근접해 조용히 TimeoutExpired로 실패하는 사례가 있었다(2026-09-04). 1200초로 완충.
     target_cwd = cwd or os.getcwd()
     proc = subprocess.run(argv, cwd=target_cwd, input=stdin_input, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=600)
+                           encoding="utf-8", errors="replace", timeout=1200)
     out, code = proc.stdout, proc.returncode
     if cli_name == "codex":
         messages = []
