@@ -10,7 +10,7 @@
     "implementer": {
       "routes": {
         "api-routed": {"provider": "anthropic", "model": "claude-sonnet-5", "input_price_per_1m": 15.0, "output_price_per_1m": 75.0},
-        "cli-routed": {"cli": "codex", "model": "gpt-5.6-sol"},
+        "cli-routed": {"cli": "claude", "model": "claude-sonnet-5"},
         "host-native": {}
       }
     },
@@ -45,7 +45,7 @@
   "cli_allowlist": {
     "claude": {
       "binary": "claude",
-      "args": ["-p", "--output-format", "json", "--permission-mode", "plan", "--disallowedTools", "Write,Edit,Bash,NotebookEdit"],
+      "args": ["-p", "--output-format", "json", "--permission-mode", "bypassPermissions", "--disallowedTools", "Write,Edit,Bash,NotebookEdit"],
       "model_arg": ["--model", "{model}"],
       "effort_args": {"low": ["--effort", "low"], "medium": ["--effort", "medium"], "high": ["--effort", "high"]},
       "allowed_efforts": ["low", "medium", "high"]

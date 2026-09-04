@@ -29,8 +29,8 @@
   #   purpose: 호출 목적
   #   approved_by: user
 
-## Planner Findings & Tradeoffs
-* [Tier 2 작업 시 planner 워커의 design_spec.md 산출물 링크 및 주요 결정사항을 기록하십시오. (Tier 1은 선택 항목)]
+## Self-Critique & Tradeoffs
+* [설계 및 구현 시 고려한 대안들과 트레이드오프, 그리고 자가 비평 내용을 작성하십시오.]
 
 ## Rationale & Sources
 * [태스크를 수행할 때 근거가 되는 코드 라인 링크 또는 지식/가이드라인 문서 경로를 기재하십시오.]
