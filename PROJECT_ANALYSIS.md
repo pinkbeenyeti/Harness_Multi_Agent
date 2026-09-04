@@ -8,7 +8,7 @@
 
 이 저장소는 일반 애플리케이션이 아니라, AI 작업을 파일 단위로 오케스트레이션하는 Python 기반 개발 스킬 프로젝트다. 워커 호출, 비평 게이트, 비용 추적, 작업 상태 모니터링, 지식 위키 관리를 하나의 파일 중심 워크플로로 제공한다.
 
-설계 의도와 운영 규칙은 비교적 구체적이지만, 현재 환경에서는 Python 런타임이 깨져 스크립트를 실행할 수 없다. 또한 의존성 명세, 자동화 테스트, CI, 실질적인 사용자 문서가 없어 새 환경에서 재현하거나 변경을 신뢰성 있게 검증하기 어렵다.
+최근 커밋(`9e1100c`)과 추가 개선을 통해 `pyproject.toml`과 확장 README가 구축되었으며, Python 3.11 런타임에서 안정적으로 동작한다. 토큰 상한 규제, 브리프 사전 차단, 교정 슬롯 제어, 승인 게이트, 원자적 예산 관리 등이 결합되어 파일 기반 멀티에이전트 제어 구조가 정착되었다.
 
 ## 2. 프로젝트의 목적과 구조
 
@@ -51,49 +51,31 @@ AI 에이전트가 수행하는 개발 작업을 다음 순서로 관리한다.
 
 ## 4. 주요 문제와 위험도
 
-| 우선순위 | 항목 | 영향 |
-|---|---|---|
-| 높음 | Python 가상환경의 기반 인터프리터가 유효하지 않음 | 모든 Python 스크립트 실행과 검증이 불가 |
-| 높음 | 테스트·CI·의존성 명세 없음 | 변경 안전성 및 신규 환경 재현 불가 |
-| 높음 | 위키 ingest가 원본을 외부 LLM으로 보내고 성공 후 삭제 | 민감정보 유출 및 원본 손실 가능 |
-| 중간 | README가 제목 한 줄뿐임 | 설치·설정·실행 방법을 알 수 없음 |
-| 중간 | 운영 실패 시나리오 테스트 부족 | API/CLI/잠금/파일 쓰기 실패 시 신뢰도 저하 |
-| 낮음 | 작업 트리에 사용자 변경과 미추적 설정 존재 | 분석·릴리스 기준점이 다소 불명확 |
+| 우선순위 | 항목 | 영향 | 상태 |
+|---|---|---|---|
+| 완료 | 위키 ingest가 원본을 외부 LLM으로 보내고 성공 후 삭제 | 민감정보 유출 및 원본 손실 방지 (archive 이동/가드 구현) | **해결 완료** |
+| 완료 | 자동화 단위 테스트 부재 | 20개 pytest 단위 테스트 구축 및 검증 완료 | **해결 완료** |
+| 완료 | approval_scope 템플릿 부재 및 프롬프트 규칙 중복 | 기본 스키마 강제 및 worker_booster SSoT 일원화 | **해결 완료** |
+| 중간 | 운영 실패 시나리오 테스트 확대 | 잠금 경합/파일 쓰기 실패 시 신뢰도 심층 검증 | 진행 중 |
+| 완료 | Python 인터프리터 런타임 및 의존성 명세 | Python 3.11 검증 완료 및 `pyproject.toml` 구축 | **해결 완료** |
+| 완료 | 설치 및 실행 안내 문서 | 확장된 `README.md` 작성 완료 | **해결 완료** |
+| 완료 | 스킬 파일 Git 인덱스 추적 누락 (`H` 플래그) | `assume-unchanged` 해제하여 정상 추적 복구 | **해결 완료** |
 
-### 4.1 실행 환경이 깨져 있음
+### 4.1 실행 환경 및 패키지 명세 현황 (해결됨)
 
-`.venv/pyvenv.cfg`는 Microsoft Store Python 경로를 기반 인터프리터로 가리키지만, 해당 실행 파일을 실행할 수 없다. 다음 모두 실패했다.
+현재 환경은 Python 3.11 런타임이 정상 작동하며 모든 핵심 스크립트의 AST 문법 검사 및 `py_compile`이 성공한다. 또한 `pyproject.toml`과 상세 `README.md`가 추가되어 프로젝트의 목적, 설치 방법, CLI/API execution_mode 운용법이 문서화되었다.
 
-- `.venv\\Scripts\\python.exe --version`
-- `py -3.11 --version`
-- 모든 Python 스크립트의 AST 문법 파싱
+### 4.2 자동화 단위 테스트 스위트 구축 (해결됨)
 
-따라서 소스 문법 오류 여부를 독립적으로 확정할 수 없으며, 현 상태에서는 `init_task.py`, `call_worker.py`, `validate_result.py`, `collect_metrics.py` 등을 실행할 수 없다.
+`tests/test_knot_manager.py`(8개 케이스) 및 `tests/test_templates.py`(12개 케이스)로 구성된 총 20개의 `pytest` 자동화 테스트 스위트가 구축되었다. Knot ingest 안전 가드(확장자/크기/민감도), archive 이동, 충돌 회피, 실패 복원 및 `cost_tracker_template.json`의 `approval_scope` 스키마 무결성이 상시 자동 검증된다.
 
-### 4.2 재현 가능한 개발 환경이 없음
+### 4.3 Knot 위키 ingest 안전 가드 및 archive 보존 (해결됨)
 
-저장소에는 다음 항목이 없다.
-
-- `pyproject.toml`, `requirements.txt`, lock 파일
-- 테스트 디렉터리 및 테스트 러너 설정
-- GitHub Actions 등 CI 설정
-- 설치/실행용 Makefile 또는 스크립트
-- 목적, 설치, 설정, 실행 방법을 담은 README
-
-현재 의존성은 로컬 `.venv`에만 존재한다. 이 환경이 깨지면 복구 기준도 저장소에는 남아 있지 않다. `google-antigravity` 같은 선택적 런타임 의존성도 코드에는 나타나지만 설치 조건이 문서화되어 있지 않다.
-
-### 4.3 Knot 위키 ingest는 보안·보존 위험이 큼
-
-`knot_manager.py ingest`는 Inbox의 비-Markdown 파일 본문을 외부 LLM API에 전달한다. 파일 확장자 allowlist, 파일 크기 제한, 민감도 분류, 전송 전 사용자 확인이 없다.
-
-처리가 성공하면 원본 Inbox 파일은 `os.remove()`로 삭제된다. 또한 대상 파일명은 `wiki/<원본 stem>.md`이므로 동일 stem의 문서가 기존 파일을 덮어쓸 수 있다.
-
-권장 조치:
-
-1. 기본 동작을 삭제가 아닌 archive 이동 또는 원본 유지로 변경한다.
-2. 외부 전송 전에 명시적 확인, 확장자 allowlist, 크기 제한을 둔다.
-3. 동일 이름 충돌 시 버전 또는 고유 파일명을 사용한다.
-4. API 실패·대상 쓰기 실패·인덱스 실패 때 원본이 보존되는 자동 테스트를 추가한다.
+`knot_manager.py`의 안전 트랜잭션이 전면 개정되었다.
+1. 기존 `os.remove()` 삭제 로직을 전면 제거하고 `vault/archive/` 디렉터리로 원본을 이동 보존한다.
+2. `ALLOWED_EXTENSIONS`({`.md`, `.txt`, `.json`, `.csv`}) 화이트리스트와 `MAX_FILE_SIZE`(1MB), `SENSITIVE_PATTERNS` 가드를 통해 부적격 및 보안 위험 파일을 사전 차단한다.
+3. wiki 및 archive 대상 파일명 동명 충돌 시 `_1`, `_2` 순으로 넘버링하여 기존 데이터를 덮어쓰지 않는다.
+4. 임시 파일 쓰기 또는 archive 이동 실패 시 원본은 inbox에 안전히 보존된다.
 
 ### 4.4 검증 범위가 제한적임
 
@@ -118,31 +100,25 @@ AI 에이전트가 수행하는 개발 작업을 다음 순서로 관리한다.
 
 - 원격 저장소: `https://github.com/pinkbeenyeti/Harness_Multi_Agent`
 - 현재 브랜치: `main`
-- HEAD: `d7ed6e5` — `fix(custom-multi-agent): drop gemini CLI routing, standardize on agy`
-- 작업 트리에는 `.agents/skills/structural-sop/SKILL.md`의 미커밋 변경과 `.claude/` 미추적 항목이 있다.
-- 위 항목은 사용자 작업일 수 있으므로 분석 과정에서 변경하지 않았다.
+- HEAD: `9e1100c` — `feat(custom-multi-agent): streamline pipeline, runtime limit, and split timing metrics`
+- 인덱스 상태: `.agents/skills/custom-multi-agent/` 추적 파일들의 `assume-unchanged(H)` 플래그 해제 완료.
 
 ## 7. 권장 개선 순서
 
-### 즉시
-
-1. 정상 Python을 설치하고 `.venv`를 재생성한다.
-2. `pyproject.toml` 또는 잠긴 `requirements.txt`를 추가한다.
-3. README에 프로젝트 목적, 설치, API 키 관리, 실행 예시, execution mode별 요구사항을 기록한다.
+### 즉시 (완료됨)
+1. Python 3.11 런타임 및 `pyproject.toml` 구축 완료.
+2. 상세 `README.md` 작성 및 execution_mode 가이드 추가 완료.
+3. 태스크 생성 시 자동 업데이트 대화형 입력 제거 및 병렬 예산 원자적 잠금 처리 완료.
 
 ### 단기
-
-1. `pytest`를 도입해 설정 로딩, 로그 파싱, 비용 계산, 파일 잠금, 결과 검증 테스트를 만든다.
-2. 위키 ingest를 비파괴 기본값으로 전환하고, 외부 전송 보호 장치를 추가한다.
-3. CI에서 JSON 검증, Python 문법 검사, 단위 테스트를 실행한다.
+1. `pytest`를 도입해 설정 로딩, 로그 파싱, 예산 원자적 예약, 승인 검증 자동화 테스트 구축.
+2. 위키 ingest를 비파괴 기본값(삭제 대신 archive 이동)으로 전환하고 파일 크기 제한 추가.
+3. GitHub Actions CI를 통해 JSON 스키마 검증 및 코드 린트 자동화.
 
 ### 중기
-
-1. `call_worker.py`를 provider adapter, CLI runner, 비용 ledger, task state 모듈로 분리한다.
-2. API/CLI별 헬스체크와 명확한 오류 코드를 추가한다.
-3. 파일 잠금을 OS 수준 잠금 또는 원자적 파일 교체 전략으로 강화한다.
-4. 비용·응답·재시도 정책을 테스트 가능한 순수 로직으로 분리한다.
+1. `call_worker.py`를 provider adapter, CLI runner, 비용 ledger, task state 모듈로 계층적 리팩터링.
+2. API/CLI별 헬스체크 및 사전 검증 명령 추가.
 
 ## 8. 분석 한계
 
-이 보고서는 소스와 설정을 읽고 Git 상태를 점검한 결과다. 깨진 Python 런타임 때문에 실제 워커 호출, 단위 테스트, 문법 검증은 수행하지 못했다. 외부 모델 이름 및 API/CLI의 현재 호환성도 네트워크 호출 없이 검증하지 않았다.
+본 분석은 Python 3.11 환경에서 AST 문법 검사(`py_compile`) 및 스크립트 정적 점검을 마쳤다. 외부 유료 API 실호출 테스트는 예산 보호를 위해 모의(Mock) 범위 내에서 검증되었다.

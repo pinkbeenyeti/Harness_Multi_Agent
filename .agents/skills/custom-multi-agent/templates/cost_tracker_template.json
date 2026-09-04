@@ -1,6 +1,14 @@
 {
   "budget_limit": 2.0,
   "execution_mode": "api-routed",
+  "approval_scope": {
+    "tier": 0,
+    "paths": [],
+    "groups": [],
+    "routes": {},
+    "auto_merge": false,
+    "scope_hash": ""
+  },
   "usd_cost": {"accumulated": 0.0, "reserved": 0.0, "history": []},
   "cli_quota": {"history": []},
   "fallback_role": "fallback-efficient",

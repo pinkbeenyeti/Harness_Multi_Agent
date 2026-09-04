@@ -2,6 +2,7 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shutil
+import fnmatch
 import re
 import json
 import urllib.request
@@ -10,6 +11,12 @@ import time
 from pathlib import Path
 
 from common_utils import load_api_keys, load_backend_config
+
+ALLOWED_EXTENSIONS = frozenset({".md", ".txt", ".json", ".csv"})
+MAX_FILE_SIZE = 1_048_576
+SENSITIVE_PATTERNS = (
+    "*key*", "*secret*", "*.env*", "*token*", "*.pem*", "*id_rsa*",
+)
 
 # 각 provider의 위키 요약용 기본 모델. backends.json에 해당 role이 없을 때만 사용되는 폴백값.
 _WIKI_MODEL_FALLBACK = {
@@ -135,9 +142,62 @@ def get_vault_path():
 def setup_vault(vault_path):
     inbox = vault_path / "inbox"
     wiki = vault_path / "wiki"
+    archive = vault_path / "archive"
     os.makedirs(inbox, exist_ok=True)
     os.makedirs(wiki, exist_ok=True)
+    os.makedirs(archive, exist_ok=True)
     return inbox, wiki
+
+def _validate_ingest_candidate(path):
+    if not path.is_file():
+        return "not a regular file"
+    lowered_name = path.name.lower()
+    if any(fnmatch.fnmatch(lowered_name, pattern) for pattern in SENSITIVE_PATTERNS):
+        return "sensitive filename"
+    if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+        return f"extension '{path.suffix}' is not allowed"
+    if path.stat().st_size > MAX_FILE_SIZE:
+        return f"file exceeds {MAX_FILE_SIZE} bytes"
+    return None
+
+def _next_available_path(directory, filename):
+    candidate = directory / filename
+    if not candidate.exists():
+        return candidate
+    source = Path(filename)
+    counter = 1
+    while True:
+        candidate = directory / f"{source.stem}_{counter}{source.suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+def _write_wiki_temp(source, destination):
+    temp_path = _next_available_path(destination.parent, f".{destination.name}.tmp")
+    try:
+        if source.suffix.lower() == ".md":
+            shutil.copy(source, temp_path)
+            return temp_path
+
+        with open(source, "r", encoding="utf-8") as source_file:
+            body = source_file.read()
+        result = call_llm_for_wiki(body, source.name)
+        with open(temp_path, "w", encoding="utf-8") as destination_file:
+            if result:
+                destination_file.write(result)
+            else:
+                destination_file.write(
+                    f"# {source.stem}\n\nConverted from source inbox file (LLM Fallback).\n\n```text\n{body}\n```\n"
+                )
+        return temp_path
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+def _archive_source(source, archive_dir):
+    destination = _next_available_path(archive_dir, source.name)
+    shutil.move(str(source), str(destination))
+    return destination
 
 # 1. SAVE: 원본 자료를 Inbox에 복사
 def save_document(file_path):
@@ -157,56 +217,41 @@ def save_document(file_path):
 def ingest_documents():
     vault_path = get_vault_path()
     inbox, wiki = setup_vault(vault_path)
-    
-    inbox_files = list(inbox.glob("*.*"))
+    archive = vault_path / "archive"
+
+    inbox_files = list(inbox.iterdir())
     if not inbox_files:
         print("[INGEST] No new documents in inbox to process.")
         return
-        
+
     print(f"[INGEST] Processing {len(inbox_files)} files from inbox...")
-    
+    ingested = False
+
     for f in inbox_files:
-        # 가공 및 컴파일 시뮬레이션:
-        # 실제 환경에서는 AI가 문서를 요약 및 마크다운 위키 형식으로 변환하여 wiki/ 폴더에 넣음.
-        # 여기서는 기본 마크다운 이식 및 텍스트 파일 복사로 가공을 수행합니다.
-        dest_filename = f.stem + ".md"
-        dest_path = wiki / dest_filename
-        
-        success = False
+        rejection = _validate_ingest_candidate(f)
+        if rejection:
+            print(f"[INGEST REJECTED] '{f.name}': {rejection}")
+            continue
+
+        dest_path = _next_available_path(wiki, f.stem + ".md")
+        temp_path = None
         try:
-            # 이미 마크다운인 경우 바로 복사, 아닌 경우 텍스트 변환 복사
-            if f.suffix.lower() == ".md":
-                shutil.copy(f, dest_path)
-                success = True
-            else:
-                with open(f, "r", encoding="utf-8", errors="ignore") as src_file:
-                    body = src_file.read()
-                    
-                print(f"[INGEST] Processing '{f.name}' through LLM for summarization and wiki generation...")
-                llm_result = call_llm_for_wiki(body, f.name)
-                
-                with open(dest_path, "w", encoding="utf-8") as dest_file:
-                    if llm_result:
-                        dest_file.write(llm_result)
-                        print(f"[INGEST] Successfully generated LLM summary for '{f.name}'")
-                    else:
-                        dest_file.write(f"# {f.stem}\n\nConverted from source inbox file (LLM Fallback).\n\n```text\n{body}\n```\n")
-                        print(f"[INGEST] Fallback to raw copy for '{f.name}' (No LLM response)")
-                success = True
+            temp_path = _write_wiki_temp(f, dest_path)
+            archived_path = _archive_source(f, archive)
+            os.replace(temp_path, dest_path)
+            ingested = True
+            print(f"[INGEST] Converted '{f.name}' -> 'wiki/{dest_path.name}'; source -> 'archive/{archived_path.name}'")
         except Exception as e:
-            print(f"[INGEST ERROR] Failed to process or write '{f.name}': {e}")
-            success = False
-            
-        # 가공 완료 후 inbox 원본 삭제 (또는 아카이빙)
-        if success:
-            try:
-                os.remove(f)
-                print(f"[INGEST] Converted & compiled '{f.name}' -> 'wiki/{dest_filename}'")
-            except Exception as e:
-                print(f"[INGEST ERROR] Failed to remove source file '{f.name}': {e}")
-        
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+            print(f"[INGEST ERROR] Failed to ingest '{f.name}': {e}")
+
     # 인덱스 파일(index.md) 자동 갱신
-    update_wiki_index(wiki)
+    if ingested:
+        try:
+            update_wiki_index(wiki)
+        except Exception as e:
+            print(f"[INGEST ERROR] Failed to update wiki index: {e}")
 
 def update_wiki_index(wiki_path):
     index_file = wiki_path / "index.md"

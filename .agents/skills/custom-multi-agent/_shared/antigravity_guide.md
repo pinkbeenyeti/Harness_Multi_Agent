@@ -44,7 +44,7 @@
 - **CLI allowlist**: `cli-routed` 서브프로세스는 사전 정의된 argv 패턴만 허용한다(`cli_allowlist_check()`). `shell=True`는 어떤 경우에도 쓰지 않는다.
 - **Google 헤더 인증**: Gemini API 키는 URL 쿼리 파라미터가 아니라 `x-goog-api-key` HTTP 헤더로 전달한다. 쿼리 파라미터 방식은 로그·프록시에 키가 노출될 수 있어 금지한다.
 - **`task_name` 경로 검증**: 사용자 입력(`task_name` 등)으로 파일 경로를 구성하는 모든 지점에서 `..`, 절대경로, 경로 구분자 포함 여부를 차단한다.
-- **fallback 안전장치**: `route_history`에 이미 실패한 `route_id`(`<role>@<execution_mode>`)를 그대로 재사용하지 않는다. fallback은 1홉으로 제한하고, fallback을 거치며 위험도(effort)를 하향하지 않는다.
+- **fallback 안전장치**: `route_history`에 이미 실패한 `route_id`(`<role>@<execution_mode>`)를 그대로 재사용하지 않는다. fallback은 사전 승인된 범위(task.md의 workers_approved 또는 approval_scope)에 fallback 역할이 명시된 경우에만 1홉으로 전환을 허용하며, 미승인 상태의 임의 전환은 ROUTE_CHANGE 게이트로 즉시 중단한다.
 
 ## 일괄 승인과 effort 적용
 
@@ -52,9 +52,9 @@ Tier 1/2는 실행 전에 경로·그룹·route·model·effort·예산·자동 �
 한 번에 승인한다. 승인 범위 안의 planner, implementer, critic 및 첫 FAIL
 후 교정에는 추가 승인을 요구하지 않는다.
 
-CLI 호출은 model과 effort를 별도 인자로 전달하고 `backends.json`의
-`allowed_efforts` 밖 값은 호출 전에 거부한다. 승인된 route 또는
-`scope_hash`가 달라지면 exit code 8로 중단한다.
+CLI 호출은 model과 effort(`low`, `medium`, `high`)를 명령행 인자로 안전하게 전달하고 `backends.json`의
+`allowed_efforts` 밖 값은 호출 전에 거부한다. (직접 API 호출 경로의 경우 provider별 effort 매핑이 아직 표준화되지 않아 warning 안내 후 기본값으로 동작하므로, effort 세밀 조정이 필요한 경우 cli-routed 사용을 권장한다.)
+승인된 route, 모델, effort 또는 `scope_hash`가 달라지면 exit code 8로 즉시 중단한다.
 
 `worker_runs`에는 성공·실패·절단을 모두 기록한다. API 예산 소진은
 `BUDGET_EXHAUSTED`, CLI/SDK 장애는 실패 run으로 기록하며 CLI 사용량을
@@ -62,10 +62,10 @@ USD `$0`으로 표현하지 않는다.
 
 ## 예산 초과 처리
 
-- `api-routed`에서 `call_worker.py`가 **Exit Code 2**로 종료되면 즉시 사용자에게 "예산 초과로 중단되었습니다. 예산을 늘려 진행할까요?"라고 질문한다.
-- 승인 시 `cost_tracker.json`의 `budget_limit`을 수동 증액한 뒤 재시도한다.
-- 폴백 역할(`fallback-efficient`)이 남아 있으면 스크립트가 자동 전환하므로 별도 조치가 필요 없다. 단, 위 fallback 안전장치(동일 route_id·순환·위험도 하향 금지)는 자동 전환에도 적용된다.
-- `cli-routed`/`host-native`는 USD 예산 개념이 없으므로 Exit Code 2가 발생하지 않는다. 쿼터 소진은 CLI/SDK 자체 오류로 나타나며, 이 경우도 `fallback-efficient`로 1홉 대체를 시도한 뒤 안 되면 사용자에게 에스컬레이션한다.
+- `api-routed`에서 `call_worker.py`가 **Exit Code 2**로 종료되면 즉시 사용자에게 "예산 초과(또는 미승인 폴백)로 중단되었습니다. 예산 증액 또는 폴백 승인을 진행할까요?"라고 안내한다.
+- 사용자가 예산 증액을 승인하면 `cost_tracker.json`의 `budget_limit`을 갱신한 뒤 재시도한다.
+- 사전 승인 내역에 폴백 역할(`fallback-efficient`)이 포함되어 있다면 스크립트가 안전하게 전환하여 호출한다.
+- `cli-routed`/`host-native`는 USD 예산 개념이 없으므로 Exit Code 2가 발생하지 않는다. 쿼터 소진은 CLI/SDK 자체 오류로 나타나며, 사용자에게 에스컬레이션한다.
 
 ## 워커 브리프에 반드시 포함할 것
 
@@ -74,4 +74,4 @@ USD `$0`으로 표현하지 않는다.
 - 성능 핫스팟 여부
 - 접촉하는 인터페이스 정의
 
-전달하지 말 것: 오케스트레이터의 대화 히스토리, 이전 태스크들의 누적 요약, 브리프 본문을 프롬프트에 붙여넣기(경로만 전달).
+전달하지 말 것: 오케스트레이터의 대화 이력·누적 요약·무관한 산출물. 해당 워커에 필요한 최소 브리프만 전달한다.

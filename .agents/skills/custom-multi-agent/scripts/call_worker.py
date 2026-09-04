@@ -30,6 +30,7 @@ from common_utils import (
     cli_allowlist_check,
     verify_worker_approval,
     verify_cross_review_integrity,
+    parse_workers_approved,
 )
 
 # 워커 응답의 출력 토큰 상한.
@@ -154,11 +155,10 @@ def finish_pipeline_slot(tracker_path, run_id, **fields):
     if finished:
         with open(os.path.join(os.path.dirname(tracker_path), "log.md"),
                   "a", encoding="utf-8") as f:
-            f.write("\n{} [WORKER_ATTEMPT] group={} stage={} attempt={} "
-                    "outcome={} verdict={}".format(
-                        datetime.now(timezone.utc).isoformat(),
-                        finished["group"], finished["stage"], finished["attempt"],
-                        finished.get("outcome"), finished.get("verdict") or "-"))
+            actor = finished.get("actor") or finished.get("role") or "worker"
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            f.write(f"\n{ts} [WORKER_ATTEMPT] [Actor: {actor}] group={finished['group']} stage={finished['stage']} "
+                    f"attempt={finished['attempt']} outcome={finished.get('outcome')} verdict={finished.get('verdict') or '-'}")
 
 def critic_verdict(text):
     m = re.search(r"(?m)^## Verdict\s*$\s*^(PASS|FAIL)\s*$", text)
@@ -553,6 +553,28 @@ def main():
         print(f"[SECURITY] {e}")
         sys.exit(1)
 
+    # 1. brief(지시서) 읽기 및 사전 검증
+    if not os.path.exists(brief_path):
+        print(f"Error: Brief file not found at '{brief_path}'")
+        sys.exit(1)
+
+    brief_check = evaluate_limits(brief_path)
+    if brief_check["violations"]:
+        print(f"[BRIEF OVER LIMIT] '{os.path.basename(brief_path)}'가 분량 상한을 초과했습니다. 워커를 기동하지 않습니다.")
+        for v in brief_check["violations"]:
+            print(f"  - {v}")
+        print("  → 브리프는 '경로 + 라인 범위 + 지시'만 담습니다. 코드 본문·배경 설명·이전 라운드 요약을 덜어내십시오.")
+
+        log_path_pre = os.path.join(task_dir, "log.md")
+        if os.path.exists(log_path_pre):
+            with open(log_path_pre, "a", encoding="utf-8") as lf:
+                lf.write(f"\n{_now()} [ERROR] [Actor: orchestrator] 브리프 '{os.path.basename(brief_path)}' 분량 상한 초과로 워커 기동 차단: "
+                         + "; ".join(brief_check["violations"]))
+        sys.exit(4)
+
+    with open(brief_path, "r", encoding="utf-8") as f:
+        prompt = f.read()
+
     cost_tracker_path = os.path.join(task_dir, "cost_tracker.json")
     lock_path = cost_tracker_path + ".lock"
 
@@ -572,24 +594,6 @@ def main():
     if google_only and execution_mode == "api-routed":
         role = "critic-standard"
 
-    last = (cost_data.get("route_history") or [{}])[-1]
-    accumulated_cost = cost_data.get("usd_cost", {}).get("accumulated", cost_data.get("accumulated_cost", 0.0))
-    route_id = f"{role}@{execution_mode}"
-    retry_blocked = last.get("route_id") == route_id and last.get("outcome") == "fail"
-
-    # 1. config 로드 및 execution_mode 가공, 1.1 예산 초과/직전 실패 재시도 시 자동 Fallback
-    if (execution_mode == "api-routed" and accumulated_cost >= budget_limit) or retry_blocked:
-        if role == fallback_role:
-            print(f"[BUDGET ERROR] fallback '{fallback_role}' 불충족.")
-            sys.exit(2)
-        reason = "예산 한도 초과" if not retry_blocked else "직전 라운드 동일 route 실패"
-        print(f"[FALLBACK] {reason}로 '{role}' -> '{fallback_role}' 전환.")
-        log_path = os.path.join(task_dir, "log.md")
-        if os.path.exists(log_path):
-            with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write(f"\n{_now()} [DECISION] {reason}({role}@{execution_mode})로 폴백 워커 '{fallback_role}'로 자동 전환하여 호출합니다.")
-        role, route_id = fallback_role, f"{fallback_role}@{execution_mode}"
-
     cli_allowlist = {}
     if execution_mode == "host-native":
         provider, model = "host-native", "agy-agent"
@@ -601,26 +605,26 @@ def main():
         if execution_mode == "cli-routed":
             cli_allowlist = _read_json(os.path.join(base_dir, "backends.json")).get("cli_allowlist", {})
 
-    # 1.2 승인 일치 검증 게이트 (Approval Enforcement)
-    approval_err = verify_worker_approval(task_dir, role, execution_mode, worker_cfg)
+    # 1.2 승인 일치 검증 게이트 (Approval Enforcement) - 실제 런타임 모델, 프로바이더, effort 전달
+    approval_err = verify_worker_approval(task_dir, role, execution_mode, worker_cfg, model=model, effort=effort, cli_or_provider=provider)
     if approval_err:
         print(f"\n[APPROVAL VIOLATION] {approval_err}")
         print("  → task.md의 workers_approved 승인 내역과 실제 실행 대상이 일치하지 않습니다.")
         log_path_pre = os.path.join(task_dir, "log.md")
         if os.path.exists(log_path_pre):
             with open(log_path_pre, "a", encoding="utf-8") as lf:
-                lf.write(f"\n{_now()} [ERROR] 승인 검증 실패로 워커 기동 차단: {approval_err}")
+                lf.write(f"\n{_now()} [ERROR] [Actor: orchestrator] 승인 검증 실패로 워커 기동 차단: {approval_err}")
         sys.exit(EXIT_APPROVAL_VIOLATION)
 
     # 1.3 이종 모델 교차 비평 인터록 (Cross-Review Interlock)
-    cross_err = verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg)
+    cross_err = verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg, model=model, cli_or_provider=provider)
     if cross_err:
         print(f"\n[CROSS-REVIEW VIOLATION] {cross_err}")
         print("  → 비평 워커는 직전 구현자와 동일한 모델 계열(Vendor)일 수 없습니다.")
         log_path_pre = os.path.join(task_dir, "log.md")
         if os.path.exists(log_path_pre):
             with open(log_path_pre, "a", encoding="utf-8") as lf:
-                lf.write(f"\n{_now()} [ERROR] 교차 비평 인터록 차단: {cross_err}")
+                lf.write(f"\n{_now()} [ERROR] [Actor: orchestrator] 교차 비평 인터록 차단: {cross_err}")
         sys.exit(EXIT_CROSS_REVIEW_VIOLATION)
 
     if isinstance(scope, dict):
@@ -638,33 +642,67 @@ def main():
             print("[APPROVAL VIOLATION] approval_scope/hash mismatch")
             sys.exit(EXIT_APPROVAL_VIOLATION)
 
-    # 2. brief(지시서) 읽기
-    if not os.path.exists(brief_path):
-        print(f"Error: Brief file not found at '{brief_path}'")
-        sys.exit(1)
-        
-    # 2.1 브리프 사전 검증 (기동 전 게이트)
-    #
-    # 브리프 상한은 규칙으로만 존재하고 강제되지 않아, 실측에서 브리프 11개가
-    # 20,140토큰(워커 결과물의 2.7배)까지 부풀었다. 브리프는 워커 프롬프트로
-    # 그대로 들어가므로 여기서 막는 것이 가장 싸다.
-    brief_check = evaluate_limits(brief_path)
-    if brief_check["violations"]:
-        print(f"[BRIEF OVER LIMIT] '{os.path.basename(brief_path)}'가 분량 상한을 초과했습니다. 워커를 기동하지 않습니다.")
-        for v in brief_check["violations"]:
-            print(f"  - {v}")
-        print("  → 브리프는 '경로 + 라인 범위 + 지시'만 담습니다. 코드 본문·배경 설명·이전 라운드 요약을 덜어내십시오.")
+    # 1.4 원자적 예산 검증 및 예약 (Race Condition 방지)
+    reserved_estimate = 0.0
+    if not is_legacy_schema and execution_mode == "api-routed":
+        reserved_estimate = round((MAX_OUTPUT_TOKENS * worker_cfg.get("output_price_per_1m", 0.0)
+                                    + (len(prompt) // 4) * worker_cfg.get("input_price_per_1m", 0.0)) / 1e6, 6)
 
-        log_path_pre = os.path.join(task_dir, "log.md")
-        if os.path.exists(log_path_pre):
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-            with open(log_path_pre, "a", encoding="utf-8") as lf:
-                lf.write(f"\n{current_time} [ERROR] 브리프 '{os.path.basename(brief_path)}' 분량 상한 초과로 워커 기동을 차단했습니다. "
-                         + "; ".join(brief_check["violations"]))
-        sys.exit(4)
+    route_id = f"{role}@{execution_mode}"
 
-    with open(brief_path, "r", encoding="utf-8") as f:
-        prompt = f.read()
+    with FileLock(lock_path):
+        cost_data = _read_json(cost_tracker_path)
+        last = (cost_data.get("route_history") or [{}])[-1]
+        retry_blocked = last.get("route_id") == route_id and last.get("outcome") == "fail"
+
+        usd_cost = cost_data.setdefault("usd_cost", {"accumulated": 0.0, "reserved": 0.0, "history": []})
+        accumulated_cost = usd_cost.get("accumulated", cost_data.get("accumulated_cost", 0.0))
+        reserved_cost = usd_cost.get("reserved", 0.0)
+        total_committed = accumulated_cost + reserved_cost
+
+        budget_exceeded = (execution_mode == "api-routed" and (total_committed + reserved_estimate) > budget_limit)
+
+        if budget_exceeded or retry_blocked:
+            reason = "예산 한도 초과(예약 포함)" if budget_exceeded else "직전 라운드 동일 route 실패"
+            task_md_path = os.path.join(task_dir, "task.md")
+            approvals = parse_workers_approved(task_md_path)
+            fallback_approved = any(a.get("worker") == fallback_role for a in approvals)
+            if isinstance(scope, dict) and scope.get("routes", {}).get(fallback_role):
+                fallback_approved = True
+
+            if fallback_approved and role != fallback_role:
+                print(f"[FALLBACK] {reason}로 승인된 폴백 워커 '{role}' -> '{fallback_role}' 전환.")
+                log_path = os.path.join(task_dir, "log.md")
+                if os.path.exists(log_path):
+                    with open(log_path, "a", encoding="utf-8") as lf:
+                        lf.write(f"\n{_now()} [DECISION] [Actor: orchestrator] {reason}({role}@{execution_mode})로 승인된 폴백 워커 '{fallback_role}'로 전환.")
+                role, route_id = fallback_role, f"{fallback_role}@{execution_mode}"
+                worker_cfg = load_backend_config(role, execution_mode)
+                provider = worker_cfg.get("provider")
+                model = worker_cfg["model"]
+                reserved_estimate = round((MAX_OUTPUT_TOKENS * worker_cfg.get("output_price_per_1m", 0.0)
+                                            + (len(prompt) // 4) * worker_cfg.get("input_price_per_1m", 0.0)) / 1e6, 6)
+                if (total_committed + reserved_estimate) > budget_limit:
+                    print(f"[BUDGET ERROR] 폴백 워커 '{fallback_role}' 또한 예산 초과 (${total_committed + reserved_estimate:.4f} > ${budget_limit:.4f}).")
+                    log_path = os.path.join(task_dir, "log.md")
+                    if os.path.exists(log_path):
+                        with open(log_path, "a", encoding="utf-8") as lf:
+                            lf.write(f"\n{_now()} [EXCEPTION_GATE] [Actor: orchestrator] BUDGET_EXHAUSTED: 폴백 워커 예산 한도 초과.")
+                    sys.exit(2)
+            else:
+                gate_tag = "BUDGET_EXHAUSTED" if budget_exceeded else "ROUTE_CHANGE"
+                print(f"[EXCEPTION_GATE] {gate_tag}: {reason}. 미승인 자동 폴백 금지 규칙에 따라 기동을 중단합니다.")
+                log_path = os.path.join(task_dir, "log.md")
+                if os.path.exists(log_path):
+                    with open(log_path, "a", encoding="utf-8") as lf:
+                        lf.write(f"\n{_now()} [EXCEPTION_GATE] [Actor: orchestrator] {gate_tag}: {reason}. 자동 전환 대신 사용자 승인을 대기합니다.")
+                sys.exit(2)
+
+        if not is_legacy_schema and execution_mode == "api-routed" and reserved_estimate:
+            usd_cost["reserved"] = round(reserved_cost + reserved_estimate, 6)
+            with open(cost_tracker_path, "w", encoding="utf-8") as cf:
+                json.dump(cost_data, cf, indent=2, ensure_ascii=False)
+
     # worker_booster.md 로드 (system_prompt 용)
     worker_booster_path = os.path.join(base_dir, "_shared", "worker_booster.md")
     system_prompt = None
@@ -690,7 +728,7 @@ def main():
     print(f"\n⚙️ [{model}] Worker '{role}'이(가) 지시를 수행하며 코드를 작성 중입니다...")
     print(f"[API Call] Running worker '{role}' via {provider} ({model})...")
     
-    # 3. execution_mode별 워커 호출 (에러 캐치 루프 포함) — api-routed는 호출 전 worst-case 예산 예약
+    # 3. execution_mode별 워커 호출 (에러 캐치 루프 포함)
     result_text = ""
     input_tokens = 0
     output_tokens = 0
@@ -699,15 +737,6 @@ def main():
 
     run_id = str(uuid.uuid4())
     started_mono = time.monotonic()
-
-    reserved_estimate = 0.0
-    if not is_legacy_schema and execution_mode == "api-routed":
-        reserved_estimate = round((MAX_OUTPUT_TOKENS * worker_cfg.get("output_price_per_1m", 0.0)
-                                    + (len(prompt) // 4) * worker_cfg.get("input_price_per_1m", 0.0)) / 1e6, 6)
-        def _reserve(d):
-            uc = d.setdefault("usd_cost", {"accumulated": 0.0, "reserved": 0.0, "history": []})
-            uc["reserved"] = round(uc.get("reserved", 0.0) + reserved_estimate, 6)
-        _update_cost_tracker(cost_tracker_path, lock_path, _reserve)
 
     try:
         reserve_pipeline_slot(
@@ -766,9 +795,10 @@ def main():
         # log.md에 상세 에러 내용 적재
         log_path = os.path.join(task_dir, "log.md")
         if os.path.exists(log_path):
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+            cli_label = worker_cfg.get("cli", provider or "unknown")
+            actor_desc = f"{cli_label}-cli/{role} ({model})"
             with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write(f"\n{current_time} [ERROR] '{role}' ({model}) API 호출 실패. 원인: {error_msg}")
+                lf.write(f"\n{_now()} [ERROR] [Actor: {actor_desc}] '{role}' ({model}) API 호출 실패. 원인: {error_msg}")
         sys.exit(1)
 
     # 3.05 출력 상한 도달(잘림) 감지
@@ -787,9 +817,10 @@ def main():
         update_task_status(task_dir, f"error (Worker '{role}' output truncated)")
 
         if os.path.exists(log_path):
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+            cli_label = worker_cfg.get("cli", provider or "unknown")
+            actor_desc = f"{cli_label}-cli/{role} ({model})"
             with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write(f"\n{current_time} [ERROR] '{role}' ({model}) 응답이 출력 상한"
+                lf.write(f"\n{_now()} [ERROR] [Actor: {actor_desc}] '{role}' ({model}) 응답이 출력 상한"
                          f"({MAX_OUTPUT_TOKENS} tokens)에 도달해 잘렸습니다. result.md 병합 금지, 범위 분할 후 재호출 필요.")
         sys.exit(3)
 

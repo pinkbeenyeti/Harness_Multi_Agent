@@ -216,15 +216,30 @@ def evaluate_limits(file_path, rules=None):
 
     if lim_b is not None and total_bytes > lim_b:
         violations.append(f"{filename}: {total_bytes} bytes > 상한 {lim_b}")
-    # limit_tokens가 주 통제 수단이다. 한글/영어를 따로 AND로 걸면 언어에 따라
-    # 한쪽만 터지는 비대칭이 생긴다(영어로 쓴 브리프는 영단어 한도에서 즉사).
-    # 언어와 무관한 단일 예산으로 통제한다.
     if lim_t is not None and tokens > lim_t:
         violations.append(f"{filename}: 근사 {tokens}토큰 > 상한 {lim_t}토큰")
     if lim_k is not None and korean > lim_k:
         violations.append(f"{filename}: 한글 {korean}자 > 상한 {lim_k}자")
     if lim_e is not None and english > lim_e:
         violations.append(f"{filename}: 영단어 {english}개 > 상한 {lim_e}개")
+
+    req_fields = file_rules.get("required_fields", [])
+    if req_fields:
+        field_patterns = {
+            "paths": [r"파일\s*경로", r"\bpaths?\b"],
+            "line_ranges": [r"수정\s*라인\s*범위", r"라인\s*범위", r"\bline_ranges?\b"],
+            "in_scope": [r"\bin[\s_-]*scope\b", r"구현\s*범위"],
+            "out_of_scope": [r"\bout[\s_-]*of[\s_-]*scope\b", r"제외\s*범위"],
+            "performance": [r"성능\s*핫스팟", r"성능", r"\bperformance\b"],
+            "previous_findings": [r"이전\s*지적", r"지적\s*사항", r"\bprevious_findings\b"],
+            "changed_hunks": [r"변경\s*(?:내역|hunk|부분)", r"\bchanged_hunks\b"],
+            "related_lines": [r"관련\s*라인", r"\brelated_lines\b"],
+        }
+        for rf in req_fields:
+            patterns = field_patterns.get(rf, [rf])
+            matched = any(re.search(p, content, re.IGNORECASE) for p in patterns)
+            if not matched:
+                violations.append(f"{filename}: 필수 항목 누락 ('{rf}')")
 
     return {
         "rule_key": rule_key,
@@ -357,17 +372,14 @@ def _run_git_cmd(args, cwd, timeout=5):
 
 def check_for_updates():
     """
-    깃허브 원격 저장소의 업데이트를 확인하고, 사용자 승인 시 자동 업데이트를 진행합니다.
-    네트워크 문제, git 미설치 등으로 인한 모든 예외는 경고 메시지만 출력하고 무시됩니다.
+    깃허브 원격 저장소의 업데이트 여부를 비간섭적(Non-blocking)으로 확인하여 알림만 출력합니다.
+    대화형 입력(y/n)이나 자동 git pull은 수행하지 않으며, 실제 반영은 사용자가 명시적으로 수행합니다.
     """
-    # 스킬 자신의 설치 경로(scripts/의 상위 폴더)를 git 명령의 기준 디렉토리로 고정.
     skill_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     try:
-        # 1. 로컬 변경사항(unstaged/staged) 확인 (충돌 예방 안전장치)
+        # 1. 로컬 변경사항 확인
         status_res = _run_git_cmd(["status", "--porcelain"], skill_dir, timeout=3)
         if status_res.stdout.strip():
-            print("\n⚠️ [Warning] 로컬 저장소에 커밋되지 않은 변경사항이 존재합니다.")
-            print("안전한 업데이트를 위해 작업을 먼저 커밋하거나 stashing 후 다시 실행하십시오.")
             return
 
         # 2. git fetch origin 수행 (타임아웃 3초)
@@ -388,37 +400,16 @@ def check_for_updates():
         if not remote_hash:
             return
 
-        # 4. 업데이트 여부 비교 및 y/n 대기 루프
+        # 4. 업데이트 여부 비교 및 알림
         if local_hash != remote_hash:
-            while True:
-                user_input = input("\n💡 [Multi-Agent Update] 깃허브 원격 저장소에 새로운 업데이트가 존재합니다. 업데이트를 다운로드하여 로컬에 반영하시겠습니까? (y/n): ").strip().lower()
-                if user_input in ["y", "yes"]:
-                    # 현재 브랜치명 추출
-                    try:
-                        branch_name = _run_git_cmd(["rev-parse", "--abbrev-ref", "HEAD"], skill_dir, timeout=3).stdout.strip()
-                    except subprocess.CalledProcessError:
-                        branch_name = "main"
-
-                    # git pull 실행 (타임아웃 10초 설정으로 행 방지)
-                    try:
-                        print(f"Applying updates from origin/{branch_name}...")
-                        _run_git_cmd(["pull", "origin", branch_name], skill_dir, timeout=10)
-                        print("[Multi-Agent Update] 업데이트가 성공적으로 반영되었습니다. 변경사항을 적용하기 위해 프로그램을 재시작하십시오.")
-                    except subprocess.CalledProcessError as pull_err:
-                        print(f"\n⚠️ [Warning] git pull 과정에서 실패가 발생했습니다: {pull_err}")
-                    break
-                elif user_input in ["n", "no"]:
-                    print("[Multi-Agent Update] 업데이트가 취소되었습니다.")
-                    break
-                else:
-                    print("올바른 입력(y/n 또는 yes/no)을 입력해 주십시오.")
+            print("\n💡 [Multi-Agent Update] 원격 저장소에 새로운 업데이트가 있습니다. 반영하려면 터미널에서 'git pull'을 실행하십시오.")
 
     except FileNotFoundError:
-        print("\n⚠️ [Warning] 시스템에 'git' 프로그램이 설치되어 있지 않거나 경로(PATH)에 등록되어 있지 않아 업데이트 확인을 건너뜁니다.")
+        pass
     except subprocess.TimeoutExpired:
-        print("\n⚠️ [Warning] 업데이트 확인 중 네트워크 타임아웃이 발생하여 업데이트 검사를 건너뜁니다.")
-    except Exception as e:
-        print(f"\n⚠️ [Warning] 업데이트를 확인하는 도중 오류가 발생했습니다: {e}")
+        pass
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -486,9 +477,9 @@ def get_model_family(name):
     return n
 
 
-def verify_worker_approval(task_dir, role, execution_mode, worker_cfg):
+def verify_worker_approval(task_dir, role, execution_mode, worker_cfg, model=None, effort=None, cli_or_provider=None):
     """
-    task.md의 workers_approved에 기록된 최신 승인 정보와 실제 실행 대상(CLI/provider, model)이
+    task.md의 workers_approved에 기록된 최신 승인 정보와 실제 실행 대상(CLI/provider, model, effort)이
     일치하는지 검증한다. 불일치 시 에러 문자열을 반환하고, 정상이면 None을 반환한다.
     """
     task_md_path = os.path.join(task_dir, "task.md")
@@ -503,14 +494,17 @@ def verify_worker_approval(task_dir, role, execution_mode, worker_cfg):
     latest = role_approvals[-1]
     approved_cli_or_prov = normalize_actor_name(latest.get("cli_or_provider", ""))
     approved_model = latest.get("model", "").strip().lower()
+    approved_effort = latest.get("effort", "").strip().lower()
 
-    if execution_mode == "cli-routed":
+    if cli_or_provider:
+        actual_cli_or_prov = normalize_actor_name(cli_or_provider)
+    elif execution_mode == "cli-routed":
         actual_cli_or_prov = normalize_actor_name(worker_cfg.get("cli", ""))
     elif execution_mode == "api-routed":
         actual_cli_or_prov = normalize_actor_name(worker_cfg.get("provider", ""))
     else:
         actual_cli_or_prov = "host-native"
-    actual_model = worker_cfg.get("model", "").strip().lower()
+    actual_model = (model or worker_cfg.get("model", "")).strip().lower()
 
     if approved_cli_or_prov and actual_cli_or_prov != approved_cli_or_prov:
         return (f"실행 CLI/프로바이더('{actual_cli_or_prov}')가 "
@@ -520,10 +514,14 @@ def verify_worker_approval(task_dir, role, execution_mode, worker_cfg):
         return (f"실행 대상 모델('{actual_model}')이 "
                 f"task.md 승인 내역('{approved_model}')과 불일치합니다.")
 
+    if approved_effort and effort and effort.strip().lower() != approved_effort:
+        return (f"실행 대상 effort('{effort.strip().lower()}')가 "
+                f"task.md 승인 내역('{approved_effort}')과 불일치합니다.")
+
     return None
 
 
-def verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg):
+def verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg, model=None, cli_or_provider=None):
     """
     비평 역할('critic-*') 기동 시, 직전 구현자(implementer)와 동일한 모델 계열(OpenAI/Anthropic/Google)의
     비평 모델이 사용되지 않도록 이종 교차 비평(Cross-Review) 원칙을 강제한다.
@@ -531,8 +529,8 @@ def verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg):
     if not role.startswith("critic"):
         return None
 
-    critic_actor = worker_cfg.get("cli") if execution_mode == "cli-routed" else worker_cfg.get("provider", "")
-    critic_model = worker_cfg.get("model", "")
+    critic_actor = cli_or_provider or (worker_cfg.get("cli") if execution_mode == "cli-routed" else worker_cfg.get("provider", ""))
+    critic_model = model or worker_cfg.get("model", "")
     critic_family = get_model_family(critic_actor) or get_model_family(critic_model)
 
     implementer_family = None
