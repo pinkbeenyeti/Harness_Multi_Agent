@@ -10,6 +10,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 import re
 import json
+import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 카운트·규칙 해석은 common_utils가 단일 진실 원천이다.
@@ -22,7 +23,57 @@ from common_utils import (
     approx_tokens,
 )
 
-def validate_file(task_name, file_path):
+def validate_metadata(content):
+    errors = []
+    if not re.search(r"(?m)^> \*\*Author\*\*: .+$", content):
+        errors.append("missing Author metadata")
+    if not re.search(r"(?m)^> \*\*Orchestrator\*\*: .+$", content):
+        errors.append("missing Orchestrator metadata")
+    return errors
+
+def parse_critic_verdict(content):
+    match = re.search(r"(?m)^## Verdict\s*$\s*^(PASS|FAIL)\s*$", content)
+    if not match:
+        raise ValueError("critic report requires PASS or FAIL under ## Verdict")
+    return match.group(1)
+
+def allowed_paths_from_brief(path):
+    if not path:
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return set(re.findall(
+            r"`([^`\n]+\.(?:py|json|md|js|ts|tsx|yml|yaml))`", f.read()))
+
+def validate_patch_document(content, allowed_paths, allow_new=False):
+    errors, paths = [], set()
+    blocks = re.findall(r"```diff\s*\n(.*?)```", content, re.S)
+    anchors = re.findall(
+        r"(?m)^`?([^\n`]+) L\d+-L\d+ (?:교체|replace)`?\s*$", content)
+    paths.update(anchors)
+    for block in blocks:
+        if not (re.search(r"(?m)^---\s+", block)
+                and re.search(r"(?m)^\+\+\+\s+", block)
+                and re.search(r"(?m)^@@(?:\s|$)", block)):
+            errors.append("unified diff requires ---, +++, and @@")
+        paths.update(re.findall(r"(?m)^\+\+\+ b/(.+)$", block))
+    new_files = set(re.findall(
+        r"(?mi)^#{1,3}\s+`?([^`\n]+)`?\s+\((?:new file|신규 파일)\)\s*$",
+        content)) if allow_new else set()
+    paths.update(new_files)
+    if not blocks and not anchors and not new_files:
+        errors.append("result requires a diff, anchor patch, or declared new file")
+    outside = paths - allowed_paths if allowed_paths else set()
+    if outside:
+        errors.append("paths outside brief: " + ", ".join(sorted(outside)))
+    headings = (
+        r"Summary|변경\s*요약", r"Diff|패치",
+        r"Reason|이유", r"Deviations|편차")
+    for heading in headings:
+        if not re.search(rf"(?mi)^#{{1,3}}\s+.*(?:{heading})", content):
+            errors.append(f"missing section: {heading}")
+    return errors
+
+def validate_file(task_name, file_path, brief_path=None, phase=None):
     if not os.path.exists(file_path):
         print(f"Error: Target file does not exist at '{file_path}'")
         sys.exit(1)
@@ -67,6 +118,23 @@ def validate_file(task_name, file_path):
     print(f"Approx Tokens: {token_cnt}{scope}")
     print(f"Korean Character Count: {korean_cnt}{scope}")
     print(f"English Word Count: {english_cnt}{scope}\n")
+
+    artifact = re.match(
+        r"^(?:result(?:_.+)?|critic_report(?:_.+)?|design_spec)\.md$",
+        filename)
+    structural_errors = validate_metadata(content) if artifact else []
+    if file_rules.get("patch_only"):
+        structural_errors += validate_patch_document(
+            content, allowed_paths_from_brief(brief_path),
+            file_rules.get("allow_full_content_for_new_files", False))
+    if file_rules.get("require_verdict"):
+        try:
+            parse_critic_verdict(content)
+        except ValueError as exc:
+            structural_errors.append(str(exc))
+    for error in structural_errors:
+        print(f"[FAIL] {error}")
+        is_valid = False
 
     # 1) 분량 한도 검사 (validate_rules.json 기반)
     if file_rules:
@@ -165,7 +233,8 @@ def validate_file(task_name, file_path):
     # 접미사를 그대로 이어붙여 짝을 찾으므로, 병렬 실행에서도 그룹마다
     # 비평이 강제된다. (예전에는 정확히 'result.md'일 때만 검사해서,
     # 접미사가 붙는 순간 게이트가 조용히 통과됐다.)
-    if filename.startswith("result") and filename.endswith(".md"):
+    if (filename.startswith("result") and filename.endswith(".md")
+            and phase != "implement-output"):
         suffix = filename[len("result"):-len(".md")]
         critic_name = f"critic_report{suffix}.md"
         task_dir = os.path.dirname(file_path)
@@ -183,7 +252,10 @@ def validate_file(task_name, file_path):
         sys.exit(1)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python validate_result.py <task_name> <file_path>")
-        sys.exit(1)
-    validate_file(sys.argv[1], sys.argv[2])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("task_name")
+    parser.add_argument("file_path")
+    parser.add_argument("--brief")
+    parser.add_argument("--phase", choices=("implement-output", "final"))
+    args = parser.parse_args()
+    validate_file(args.task_name, args.file_path, args.brief, args.phase)

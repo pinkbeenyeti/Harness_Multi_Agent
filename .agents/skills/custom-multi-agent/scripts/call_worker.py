@@ -2,8 +2,13 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import json
+import argparse
+import hashlib
+import re
 import subprocess
 import shutil
+import uuid
+from dataclasses import dataclass
 
 # Windows cp949 인코딩 크래시 방지
 if hasattr(sys.stdout, 'reconfigure'):
@@ -15,7 +20,7 @@ import urllib.request
 import urllib.error
 import time
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from common_utils import (
     load_api_keys,
     load_backend_config as _shared_load_backend_config,
@@ -23,13 +28,142 @@ from common_utils import (
     resolve_execution_mode,
     validate_task_name,
     cli_allowlist_check,
+    verify_worker_approval,
+    verify_cross_review_integrity,
 )
 
 # 워커 응답의 출력 토큰 상한.
-# 이전에는 anthropic 경로에만 4000이 걸려 있었고, 상한에 닿아도 아무 신호 없이
-# 잘린 result.md가 그대로 저장됐다. 상한을 올리고, 상한에 닿았는지를
-# provider별 종료 사유로 감지해 조용한 잘림을 에러로 승격한다.
 MAX_OUTPUT_TOKENS = 8000
+EXIT_CORRECTION_LIMIT = 6
+EXIT_CROSS_REVIEW_VIOLATION = 7
+EXIT_APPROVAL_VIOLATION = 8
+
+@dataclass(frozen=True)
+class PipelineKey:
+    task: str
+    group: str
+
+class PipelineViolation(RuntimeError):
+    pass
+
+def parse_args(argv):
+    p = argparse.ArgumentParser()
+    p.add_argument("role")
+    p.add_argument("brief")
+    p.add_argument("result")
+    p.add_argument("legacy_effort", nargs="?")
+    p.add_argument("--stage", choices=("plan", "implement", "critic"))
+    p.add_argument("--group", default="default")
+    p.add_argument("--attempt", type=int, choices=(1, 2), default=1)
+    p.add_argument("--model")
+    p.add_argument("--effort")
+    a = p.parse_args(argv)
+    if a.legacy_effort:
+        print("[DEPRECATED] positional effort; use --effort")
+        a.effort = a.effort or a.legacy_effort
+    a.stage = a.stage or (
+        "critic" if a.role.startswith("critic")
+        else "plan" if a.role == "planner" else "implement")
+    return a
+
+def _default_effort(stage, tier):
+    return "medium" if stage == "plan" or int(tier or 1) >= 2 else "low"
+
+def _scope_hash(scope):
+    value = {
+        "tier": scope.get("tier"),
+        "paths": sorted(os.path.normpath(str(p)).replace("\\", "/")
+                        for p in scope.get("paths", [])),
+        "groups": sorted(scope.get("groups", [])),
+        "routes": scope.get("routes", {}),
+        "auto_merge": bool(scope.get("auto_merge")),
+    }
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+def scan_pipeline_attempts(task_dir, group):
+    tracker = _read_json(os.path.join(task_dir, "cost_tracker.json"))
+    if isinstance(tracker.get("worker_runs"), list):
+        return [r for r in tracker["worker_runs"]
+                if r.get("group", "default") == group]
+    path = os.path.join(task_dir, "log.md")
+    if not os.path.exists(path):
+        return []
+    pattern = re.compile(
+        r"\[WORKER_ATTEMPT\].*?\bgroup=(\S+).*?\bstage=(plan|implement|critic)"
+        r".*?\battempt=([12]).*?\boutcome=(\w+)(?:.*?\bverdict=(PASS|FAIL))?")
+    runs = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = pattern.search(line)
+            if m and m.group(1) == group:
+                runs.append({"group": group, "stage": m.group(2),
+                    "attempt": int(m.group(3)), "outcome": m.group(4),
+                    "verdict": m.group(5), "legacy": True})
+    return runs
+
+def expected_transition(runs):
+    ended = [r for r in runs if r.get("outcome") != "running"]
+    plans = [r for r in ended if r.get("stage") == "plan"]
+    if len(plans) > 1:
+        raise PipelineViolation("planner may run at most once")
+    work = [r for r in ended if r.get("stage") != "plan"]
+    if not work:
+        return ("implement", 1)
+    last = work[-1]
+    stage, attempt = last.get("stage"), int(last.get("attempt", 1))
+    if last.get("outcome") != "success":
+        return ("implement", 2) if attempt == 1 else None
+    if stage == "implement":
+        return ("critic", attempt)
+    if last.get("verdict") == "PASS":
+        return None
+    return ("implement", 2) if attempt == 1 else None
+
+def reserve_pipeline_slot(tracker_path, key, stage, attempt, run_id):
+    legacy = scan_pipeline_attempts(os.path.dirname(tracker_path), key.group)
+    def mutate(data):
+        stored = data.get("worker_runs")
+        runs = stored if isinstance(stored, list) else legacy
+        group_runs = [r for r in runs if r.get("group", "default") == key.group]
+        expected = expected_transition(group_runs)
+        if stage == "plan":
+            if any(r.get("stage") == "plan" for r in group_runs):
+                raise PipelineViolation("planner already consumed")
+        elif expected != (stage, attempt):
+            raise PipelineViolation(f"expected {expected}, got {(stage, attempt)}")
+        if not isinstance(stored, list):
+            data["worker_runs"] = list(legacy)
+        data["worker_runs"].append({
+            "run_id": run_id, "group": key.group, "stage": stage,
+            "attempt": attempt, "outcome": "running",
+            "started_at": datetime.now(timezone.utc).isoformat()})
+    _update_cost_tracker(tracker_path, tracker_path + ".lock", mutate)
+
+def finish_pipeline_slot(tracker_path, run_id, **fields):
+    finished = {}
+    def mutate(data):
+        for run in data.get("worker_runs", []):
+            if run.get("run_id") == run_id:
+                run.update(fields)
+                run["ended_at"] = datetime.now(timezone.utc).isoformat()
+                finished.update(run)
+                return
+    _update_cost_tracker(tracker_path, tracker_path + ".lock", mutate)
+    if finished:
+        with open(os.path.join(os.path.dirname(tracker_path), "log.md"),
+                  "a", encoding="utf-8") as f:
+            f.write("\n{} [WORKER_ATTEMPT] group={} stage={} attempt={} "
+                    "outcome={} verdict={}".format(
+                        datetime.now(timezone.utc).isoformat(),
+                        finished["group"], finished["stage"], finished["attempt"],
+                        finished.get("outcome"), finished.get("verdict") or "-"))
+
+def critic_verdict(text):
+    m = re.search(r"(?m)^## Verdict\s*$\s*^(PASS|FAIL)\s*$", text)
+    return m.group(1) if m else None
+
 
 
 def load_backend_config(role, execution_mode="api-routed"):
@@ -199,15 +333,15 @@ def _read_json(path):
     except Exception:
         return {}
 
-def call_worker_cli(cli_name, model, prompt, allowlist, effort=None, system_prompt=None):
+def call_worker_cli(cli_name, *, model, effort, prompt, allowlist, system_prompt=None, cwd=None):
     entry = allowlist.get(cli_name)
     if not entry:
         raise ValueError(f"CLI '{cli_name}' not in allowlist")
-    argv = [entry["binary"]] + list(entry["args"]) + [model]
-    if effort and cli_name == "claude":
-        argv += ["--effort", effort]
-    elif effort:
-        print(f"[WARN] {cli_name} effort 미확인(§0), 무시")
+    if effort not in entry.get("allowed_efforts", []):
+        raise ValueError(f"unsupported effort '{effort}' for CLI '{cli_name}'")
+    expand = lambda xs: [x.format(model=model, effort=effort) for x in xs]
+    argv = ([entry["binary"]] + list(entry.get("args", []))
+            + expand(entry["model_arg"]) + expand(entry["effort_args"][effort]))
     cli_allowlist_check(cli_name, argv)  # 자유 텍스트(프롬프트) 추가 전에 검증
     composed = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{prompt}" if system_prompt else prompt
     if cli_name == "agy":
@@ -228,15 +362,38 @@ def call_worker_cli(cli_name, model, prompt, allowlist, effort=None, system_prom
     # 자식 프로세스 stdin/stdout을 인코딩/디코딩한다. 브리프의 em-dash(—) 등
     # cp949로 표현 불가능한 문자가 있으면 UnicodeEncodeError로 즉시 실패한다.
     # encoding="utf-8"을 명시해 시스템 로케일과 무관하게 항상 UTF-8을 쓴다.
-    proc = subprocess.run(argv, input=stdin_input, capture_output=True, text=True,
+    target_cwd = cwd or os.getcwd()
+    proc = subprocess.run(argv, cwd=target_cwd, input=stdin_input, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=600)
     out, code = proc.stdout, proc.returncode
-    key = {"claude": "result", "agy": "response"}.get(cli_name)
-    if key:
-        try:
-            out = json.loads(out).get(key, out)
-        except Exception:
-            pass
+    if cli_name == "codex":
+        messages = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+                if evt.get("type") == "item.completed":
+                    item = evt.get("item", {})
+                    if item.get("type") == "agent_message" and "text" in item:
+                        messages.append(item["text"])
+            except Exception:
+                pass
+        if messages:
+            out = messages[-1]
+    else:
+        key = {"claude": "result", "agy": "response"}.get(cli_name)
+        if key:
+            try:
+                data = json.loads(out)
+                if cli_name == "agy" and data.get("denied_actions"):
+                    print(f"[WARN] agy denied actions: {data.get('denied_actions')}")
+                out = data.get(key, out)
+            except Exception:
+                pass
+    if not out.strip() and proc.stderr:
+        print(f"[WARN] {cli_name} returned empty output. Stderr: {proc.stderr.strip()[:500]}")
     return out, code
 
 def _update_cost_tracker(path, lock_path, mutate_fn):
@@ -377,14 +534,10 @@ class FileLock:
                 pass
 
 def main():
-    if len(sys.argv) < 4:
-        print("Usage: python call_worker.py <worker_role> <brief_file_path> <result_file_path> [effort]")
-        sys.exit(1)
-
-    role = sys.argv[1]
-    brief_path = sys.argv[2]
-    result_path = sys.argv[3]
-    effort = sys.argv[4] if len(sys.argv) > 4 else None
+    args = parse_args(sys.argv[1:])
+    role = args.role
+    brief_path = args.brief
+    result_path = args.result
 
     # base_dir 명시적 정의 (NameError 방지)
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -407,6 +560,10 @@ def main():
         cost_data = _read_json(cost_tracker_path)
     budget_limit = cost_data.get("budget_limit", 2.0)
     fallback_role = cost_data.get("fallback_role", "fallback-efficient")
+
+    scope = cost_data.get("approval_scope")
+    tier = scope.get("tier", 1) if isinstance(scope, dict) else 1
+    effort = args.effort or _default_effort(args.stage, tier)
 
     is_legacy_schema = "execution_mode" not in cost_data
     execution_mode, google_only, legacy_warn = resolve_execution_mode(cost_data)
@@ -439,9 +596,47 @@ def main():
         worker_cfg = {"input_price_per_1m": 0.0, "output_price_per_1m": 0.0}
     else:
         worker_cfg = load_backend_config(role, execution_mode)
-        provider, model = worker_cfg.get("provider"), worker_cfg["model"]
+        provider = worker_cfg.get("provider")
+        model = args.model or worker_cfg["model"]
         if execution_mode == "cli-routed":
             cli_allowlist = _read_json(os.path.join(base_dir, "backends.json")).get("cli_allowlist", {})
+
+    # 1.2 승인 일치 검증 게이트 (Approval Enforcement)
+    approval_err = verify_worker_approval(task_dir, role, execution_mode, worker_cfg)
+    if approval_err:
+        print(f"\n[APPROVAL VIOLATION] {approval_err}")
+        print("  → task.md의 workers_approved 승인 내역과 실제 실행 대상이 일치하지 않습니다.")
+        log_path_pre = os.path.join(task_dir, "log.md")
+        if os.path.exists(log_path_pre):
+            with open(log_path_pre, "a", encoding="utf-8") as lf:
+                lf.write(f"\n{_now()} [ERROR] 승인 검증 실패로 워커 기동 차단: {approval_err}")
+        sys.exit(EXIT_APPROVAL_VIOLATION)
+
+    # 1.3 이종 모델 교차 비평 인터록 (Cross-Review Interlock)
+    cross_err = verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg)
+    if cross_err:
+        print(f"\n[CROSS-REVIEW VIOLATION] {cross_err}")
+        print("  → 비평 워커는 직전 구현자와 동일한 모델 계열(Vendor)일 수 없습니다.")
+        log_path_pre = os.path.join(task_dir, "log.md")
+        if os.path.exists(log_path_pre):
+            with open(log_path_pre, "a", encoding="utf-8") as lf:
+                lf.write(f"\n{_now()} [ERROR] 교차 비평 인터록 차단: {cross_err}")
+        sys.exit(EXIT_CROSS_REVIEW_VIOLATION)
+
+    if isinstance(scope, dict):
+        route_key = "critic" if args.stage == "critic" else role
+        approved = scope.get("routes", {}).get(route_key, {})
+        actual_route = worker_cfg.get("cli", provider)
+        invalid = (
+            (scope.get("scope_hash") and scope.get("scope_hash") != _scope_hash(scope))
+            or (scope.get("groups") and args.group not in scope.get("groups", []))
+            or (approved.get("cli_or_provider")
+                and approved["cli_or_provider"] != actual_route)
+            or (approved.get("model") and approved["model"] != model)
+            or (approved.get("effort") and approved["effort"] != effort))
+        if invalid:
+            print("[APPROVAL VIOLATION] approval_scope/hash mismatch")
+            sys.exit(EXIT_APPROVAL_VIOLATION)
 
     # 2. brief(지시서) 읽기
     if not os.path.exists(brief_path):
@@ -487,9 +682,10 @@ def main():
     
     log_path = os.path.join(task_dir, "log.md")
     if os.path.exists(log_path):
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+        cli_label = worker_cfg.get("cli", provider or "unknown")
+        actor_desc = f"{cli_label}-cli/{role} ({model})"
         with open(log_path, "a", encoding="utf-8") as lf:
-            lf.write(f"\n{current_time} [WORKER_START] '{role}' ({model}) 호출 개시. (워커가 지시를 수행하고 결과를 작성 중...)")
+            lf.write(f"\n{_now()} [WORKER_START] [Actor: {actor_desc}] '{role}' ({model}) 호출 개시. (워커가 지시를 수행하고 결과를 작성 중...)")
             
     print(f"\n⚙️ [{model}] Worker '{role}'이(가) 지시를 수행하며 코드를 작성 중입니다...")
     print(f"[API Call] Running worker '{role}' via {provider} ({model})...")
@@ -501,6 +697,9 @@ def main():
     truncated = False
     exit_code = 0
 
+    run_id = str(uuid.uuid4())
+    started_mono = time.monotonic()
+
     reserved_estimate = 0.0
     if not is_legacy_schema and execution_mode == "api-routed":
         reserved_estimate = round((MAX_OUTPUT_TOKENS * worker_cfg.get("output_price_per_1m", 0.0)
@@ -511,14 +710,31 @@ def main():
         _update_cost_tracker(cost_tracker_path, lock_path, _reserve)
 
     try:
+        reserve_pipeline_slot(
+            cost_tracker_path,
+            PipelineKey(os.path.basename(task_dir), args.group),
+            args.stage, args.attempt, run_id)
+    except PipelineViolation as exc:
+        print(f"[PIPELINE VIOLATION] {exc}")
+        sys.exit(EXIT_CORRECTION_LIMIT)
+
+    try:
         if execution_mode == "cli-routed":
-            result_text, exit_code = call_worker_cli(worker_cfg["cli"], model, prompt, cli_allowlist, effort=effort, system_prompt=system_prompt)
+            workspace_dir = os.path.dirname(os.path.dirname(base_dir))
+            result_text, exit_code = call_worker_cli(
+                worker_cfg["cli"], model=model, effort=effort, prompt=prompt,
+                allowlist=cli_allowlist, system_prompt=system_prompt,
+                cwd=workspace_dir
+            )
             if exit_code != 0:
                 raise RuntimeError(f"CLI exit code {exit_code}")
         elif execution_mode == "host-native":
             try:
                 result_text, input_tokens, output_tokens, truncated = safe_run_async(call_antigravity_sdk(prompt, system_prompt))
             except RuntimeError as sdk_err:
+                finish_pipeline_slot(
+                    cost_tracker_path, run_id, role=role, outcome="error",
+                    execution_wallclock_sec=round(time.monotonic()-started_mono, 3))
                 print(f"[HOST-NATIVE] {sdk_err} — Agent 도구로 서브에이전트 기동 필요"
                       "(result.md/critic_report.md 직접 작성).")
                 sys.exit(5)
@@ -530,6 +746,9 @@ def main():
             print(f"Error: Unsupported provider '{provider}'")
             sys.exit(1)
     except Exception as e:
+        finish_pipeline_slot(
+            cost_tracker_path, run_id, role=role, outcome="error",
+            execution_wallclock_sec=round(time.monotonic()-started_mono, 3))
         error_msg = str(e)
         print(f"[API ERROR] {error_msg}")
 
@@ -553,9 +772,10 @@ def main():
         sys.exit(1)
 
     # 3.05 출력 상한 도달(잘림) 감지
-    # 잘린 응답을 정상 result.md로 저장하면 diff가 중간에 끊긴 채 병합되어
-    # 소리 없이 깨진 코드가 반영된다. 부분 결과는 진단용으로 남기되 실패로 처리한다.
     if truncated:
+        finish_pipeline_slot(
+            cost_tracker_path, run_id, role=role, outcome="truncated",
+            execution_wallclock_sec=round(time.monotonic()-started_mono, 3))
         banner = (f"<!-- TRUNCATED: 워커 '{role}'({model}) 응답이 출력 상한"
                   f"({MAX_OUTPUT_TOKENS} tokens)에 도달해 중간에 잘렸습니다. "
                   f"이 파일을 병합하지 마십시오. 브리프 범위를 쪼개 재호출하십시오. -->\n\n")
@@ -576,6 +796,12 @@ def main():
     # 4. 결과 작성 및 트래커 정산 (usd_cost/cli_quota 분리, 레거시 스키마는 기존 방식 유지)
     with open(result_path, "w", encoding="utf-8") as f:
         f.write(result_text)
+
+    finish_pipeline_slot(
+        cost_tracker_path, run_id, role=role, model=model, effort=effort,
+        outcome="success",
+        verdict=critic_verdict(result_text) if args.stage == "critic" else None,
+        execution_wallclock_sec=round(time.monotonic()-started_mono, 3))
 
     # 리뷰 진행 중으로 상태 업데이트
     update_task_status(task_dir, "reviewing (Orchestrator is verifying the output...)")
@@ -607,8 +833,10 @@ def main():
     _update_cost_tracker(cost_tracker_path, lock_path, _settle)
     log_path = os.path.join(task_dir, "log.md")
     if os.path.exists(log_path):
+        cli_label = worker_cfg.get("cli", provider or "unknown")
+        actor_desc = f"{cli_label}-cli/{role} ({model})"
         with open(log_path, "a", encoding="utf-8") as lf:
-            lf.write(f"\n{_now()} [WORKER_CALL] '{role}' ({model}, {execution_mode}) 완료.")
+            lf.write(f"\n{_now()} [WORKER_CALL] [Actor: {actor_desc}] '{role}' ({model}, {execution_mode}) 완료.")
 
 if __name__ == "__main__":
     main()

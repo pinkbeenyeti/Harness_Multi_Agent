@@ -11,7 +11,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 import re
 import json
 import glob
-from datetime import datetime
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 토큰 근사와 분량 규칙은 common_utils가 단일 진실 원천이다.
@@ -117,13 +117,36 @@ def collect_artifacts(task_dir):
 # ---------------------------------------------------------------------------
 # log.md 기반 라운드트립 / 소요시간 계측
 # ---------------------------------------------------------------------------
+ISO_LOG_RE = re.compile(
+    r"^(\S+)\s+\[([A-Z_]+)\]\s*(.*)$")
+
+def normalize_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
 def parse_log(log_path):
     entries = []
     if not os.path.exists(log_path):
         return entries
     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
-            parsed = parse_log_line(line.rstrip("\n"))
+            raw = line.rstrip("\n")
+            iso = ISO_LOG_RE.match(raw)
+            if iso:
+                ts = normalize_datetime(iso.group(1))
+                if ts and iso.group(2) != "METRICS":
+                    entries.append({"ts": ts, "tag": iso.group(2),
+                                    "text": iso.group(3), "has_time": True})
+                continue
+            parsed = parse_log_line(raw)
             if not parsed:
                 continue  # 연속 들여쓰기 줄은 직전 항목의 부속 내용이므로 건너뛴다
             tag, date, hhmm, text = parsed
@@ -136,15 +159,17 @@ def parse_log(log_path):
                                        "%Y-%m-%d %H:%M" if hhmm else "%Y-%m-%d")
             except ValueError:
                 continue
-            entries.append({"ts": ts, "tag": tag, "text": text, "has_time": bool(hhmm)})
+            entries.append({"ts": normalize_datetime(ts), "tag": tag,
+                            "text": text, "has_time": bool(hhmm)})
     return entries
 
 
 def analyze_log(entries):
     if not entries:
         return {
-            "entries": 0, "tags": {}, "elapsed_min": 0, "time_by_tag_min": {},
-            "out_of_order": 0, "no_time_entries": 0, "timed_entries": 0,
+            "entries": 0, "tags": {}, "elapsed_min": 0, "elapsed_sec": 0.0,
+            "time_by_tag_min": {}, "out_of_order": 0, "no_time_entries": 0,
+            "timed_entries": 0,
         }
 
     tags = {}
@@ -153,10 +178,11 @@ def analyze_log(entries):
 
     # 시각이 없는 항목(날짜만 기록)은 소요시간 집계에서 제외한다.
     timed = [e for e in entries if e["has_time"]]
-    elapsed_min = 0
+    elapsed_sec = 0.0
     if len(timed) >= 2:
         ts = [e["ts"] for e in timed]
-        elapsed_min = int((max(ts) - min(ts)).total_seconds() // 60)
+        elapsed_sec = (max(ts) - min(ts)).total_seconds()
+    elapsed_min = int(elapsed_sec // 60)
 
     # 각 항목 사이의 경과시간을 '앞선 항목의 태그'에 귀속시킨다.
     # 즉 WORKER_CALL 뒤 VERIFICATION까지 걸린 시간은 WORKER_CALL 몫으로 잡힌다.
@@ -174,11 +200,93 @@ def analyze_log(entries):
         "entries": len(entries),
         "tags": tags,
         "elapsed_min": elapsed_min,
+        "elapsed_sec": elapsed_sec,
         "time_by_tag_min": {k: round(v, 1) for k, v in sorted(time_by_tag.items())},
         "out_of_order": out_of_order,
         "no_time_entries": len(entries) - len(timed),
         "timed_entries": len(timed),
     }
+
+
+def union_duration(intervals):
+    intervals = sorted((a, b) for a, b in intervals if a and b and b >= a)
+    total, end = 0.0, None
+    for start, stop in intervals:
+        if end is None or start > end:
+            total += (stop - start).total_seconds()
+            end = stop
+        elif stop > end:
+            total += (stop - end).total_seconds()
+            end = stop
+    return round(total, 3)
+
+
+def analyze_wait_intervals(entries):
+    active, intervals, by_reason = {}, [], {}
+    for entry in sorted(entries, key=lambda e: e["ts"]):
+        match = re.search(r"reason=([\w-]+)", entry["text"])
+        reason = match.group(1) if match else "unspecified"
+        if entry["tag"] in ("WAIT_START", "EXCEPTION_GATE"):
+            active[reason] = entry["ts"]
+        elif entry["tag"] == "WAIT_END" and reason in active:
+            interval = (active.pop(reason), entry["ts"])
+            intervals.append(interval)
+            by_reason.setdefault(reason, []).append(interval)
+    return {
+        "waiting_wallclock_sec": union_duration(intervals),
+        "waiting_by_reason_sec": {k: union_duration(v) for k, v in by_reason.items()},
+    }
+
+
+def analyze_worker_runs(cost_data):
+    runs = cost_data.get("worker_runs")
+    if not isinstance(runs, list):
+        return {
+            "runs": None, "measurement_source": "legacy_log_estimate",
+            "execution_wallclock_sec": None,
+            "worker_process_sum_sec": None,
+        }
+    intervals, process_sum = [], 0.0
+    for run in runs:
+        start = normalize_datetime(run.get("started_at"))
+        end = normalize_datetime(run.get("ended_at"))
+        if start and end:
+            intervals.append((start, end))
+        process_sum += float(run.get("execution_wallclock_sec") or 0)
+    return {
+        "runs": runs, "measurement_source": "worker_runs_v2",
+        "execution_wallclock_sec": union_duration(intervals),
+        "worker_process_sum_sec": round(process_sum, 3),
+    }
+
+
+def pipeline_violations(runs):
+    errors, groups = [], {}
+    for run in runs:
+        if run.get("stage") != "plan" and run.get("outcome") != "running":
+            groups.setdefault(run.get("group", "default"), []).append(run)
+    for group, items in groups.items():
+        expected = ("implement", 1)
+        for run in items:
+            actual = (run.get("stage"), int(run.get("attempt", 1)))
+            if expected is None:
+                errors.append(f"POST_TERMINAL_CALL: {group}")
+                break
+            if actual != expected:
+                errors.append(f"PIPELINE_ORDER: {group} expected {expected}, got {actual}")
+                break
+            if run.get("outcome") != "success":
+                expected = ("implement", 2) if actual[1] == 1 else None
+            elif actual[0] == "implement":
+                expected = ("critic", actual[1])
+            elif run.get("verdict") == "PASS":
+                expected = None
+            elif actual[1] == 1:
+                expected = ("implement", 2)
+            else:
+                errors.append(f"CRITIC_FAILED_TWICE: {group}")
+                expected = None
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +323,8 @@ def check_brief_limits(task_dir):
     return offenders
 
 
-def check_compliance(tags, groups=1, brief_violations=None, brief_tok=0, worker_tok=0):
+def check_compliance(tags, groups=1, brief_violations=None, brief_tok=0,
+                     worker_tok=0, worker_runs=None):
     """
     groups: 병렬 실행 그룹 수(= result*.md 개수). 워커를 파일 그룹별로 병렬
     기동하면 그룹 수만큼 호출이 늘어나는 것이 정상이므로, 교정 루프 상한도
@@ -242,7 +351,12 @@ def check_compliance(tags, groups=1, brief_violations=None, brief_tok=0, worker_
         violations.append(
             "APPROVAL_UNLOGGED: 워커가 실행됐으나 사용자 승인 기록이 0건입니다. "
             "승인 즉시 log.md에 [APPROVAL]을 남겨야 감사 추적이 됩니다.")
-    if worker_calls > call_limit:
+
+    state_errors = (pipeline_violations(worker_runs)
+                    if worker_runs is not None else [])
+    violations.extend(state_errors)
+    legacy_exceeded = worker_runs is None and worker_calls > call_limit
+    if legacy_exceeded:
         detail = f"{MAX_WORKER_CALLS}회 × {groups}그룹" if groups > 1 else f"{MAX_WORKER_CALLS}회 = 최초 1 + 교정 3"
         violations.append(
             f"CORRECTION_LOOP_EXCEEDED: 워커 호출 {worker_calls}회로 상한"
@@ -264,7 +378,7 @@ def check_compliance(tags, groups=1, brief_violations=None, brief_tok=0, worker_
         "worker_call_limit": call_limit,
         "critic_missing": worker_calls > 0 and verifications == 0,
         "approval_unlogged": worker_calls > 0 and approvals == 0,
-        "correction_loop_exceeded": worker_calls > call_limit,
+        "correction_loop_exceeded": legacy_exceeded or bool(state_errors),
         "brief_over_limit": bool(brief_violations),
         "brief_result_ratio_exceeded": worker_tok > 0 and brief_tok / worker_tok > 2.0,
     }
@@ -279,8 +393,17 @@ def build_metrics(base_dir, task_name):
         raise FileNotFoundError(f"Task '{task_name}' not found at {task_dir}")
 
     artifacts = collect_artifacts(task_dir)
-    log_stats = analyze_log(parse_log(os.path.join(task_dir, "log.md")))
+    log_entries = parse_log(os.path.join(task_dir, "log.md"))
+    log_stats = analyze_log(log_entries)
     overhead = measure_fixed_overhead(base_dir)
+
+    try:
+        with open(os.path.join(task_dir, "cost_tracker.json"), encoding="utf-8") as f:
+            cost_data = json.load(f)
+    except (OSError, ValueError):
+        cost_data = {}
+    run_stats = analyze_worker_runs(cost_data)
+    wait_stats = analyze_wait_intervals(log_entries)
 
     def bucket_tok(name):
         return artifacts.get(name, {}).get("total_tokens", 0)
@@ -320,9 +443,20 @@ def build_metrics(base_dir, task_name):
         },
         "wallclock": {
             "elapsed_min": log_stats["elapsed_min"],
+            "elapsed_wallclock_sec": log_stats["elapsed_sec"],
+            "execution_wallclock_sec": run_stats["execution_wallclock_sec"],
+            "worker_process_sum_sec": run_stats["worker_process_sum_sec"],
+            "waiting_wallclock_sec": wait_stats["waiting_wallclock_sec"],
+            "waiting_by_reason_sec": wait_stats["waiting_by_reason_sec"],
+            "orchestration_overhead_sec": (
+                None if run_stats["execution_wallclock_sec"] is None else
+                max(0.0, round(log_stats["elapsed_sec"]
+                    - run_stats["execution_wallclock_sec"]
+                    - wait_stats["waiting_wallclock_sec"], 3))),
             "time_by_tag_min": log_stats["time_by_tag_min"],
             "out_of_order_entries": log_stats["out_of_order"],
             "entries_without_time": log_stats["no_time_entries"],
+            "measurement_source": run_stats["measurement_source"],
         },
         "artifact_tokens": {
             "brief": brief_tok,
@@ -345,7 +479,8 @@ def build_metrics(base_dir, task_name):
         },
         "compliance": check_compliance(tags, groups=parallel_groups,
                                        brief_violations=check_brief_limits(task_dir),
-                                       brief_tok=brief_tok, worker_tok=worker_tok),
+                                       brief_tok=brief_tok, worker_tok=worker_tok,
+                                       worker_runs=run_stats["runs"]),
         "fixed_overhead": overhead,
         "artifacts": {k: {"bytes": v["bytes"], "total_tokens": v["total_tokens"],
                           "code_tokens": v["code_tokens"], "prose_tokens": v["prose_tokens"],
@@ -370,6 +505,10 @@ def compact_snapshot(metrics):
         "verifications": metrics["roundtrips"]["verifications"],
         "user_approvals": metrics["roundtrips"]["user_approvals"],
         "elapsed_min": metrics["wallclock"]["elapsed_min"],
+        "execution_wallclock_sec": metrics["wallclock"]["execution_wallclock_sec"],
+        "waiting_wallclock_sec": metrics["wallclock"]["waiting_wallclock_sec"],
+        "orchestration_overhead_sec": metrics["wallclock"]["orchestration_overhead_sec"],
+        "measurement_source": metrics["wallclock"]["measurement_source"],
         "artifact_tokens": dict(metrics["artifact_tokens"]),
         "worker_code_share_pct": d["worker_code_share_pct"],
         "critic_share_pct": d["critic_share_pct"],

@@ -46,6 +46,20 @@
 - **`task_name` 경로 검증**: 사용자 입력(`task_name` 등)으로 파일 경로를 구성하는 모든 지점에서 `..`, 절대경로, 경로 구분자 포함 여부를 차단한다.
 - **fallback 안전장치**: `route_history`에 이미 실패한 `route_id`(`<role>@<execution_mode>`)를 그대로 재사용하지 않는다. fallback은 1홉으로 제한하고, fallback을 거치며 위험도(effort)를 하향하지 않는다.
 
+## 일괄 승인과 effort 적용
+
+Tier 1/2는 실행 전에 경로·그룹·route·model·effort·예산·자동 병합 범위를
+한 번에 승인한다. 승인 범위 안의 planner, implementer, critic 및 첫 FAIL
+후 교정에는 추가 승인을 요구하지 않는다.
+
+CLI 호출은 model과 effort를 별도 인자로 전달하고 `backends.json`의
+`allowed_efforts` 밖 값은 호출 전에 거부한다. 승인된 route 또는
+`scope_hash`가 달라지면 exit code 8로 중단한다.
+
+`worker_runs`에는 성공·실패·절단을 모두 기록한다. API 예산 소진은
+`BUDGET_EXHAUSTED`, CLI/SDK 장애는 실패 run으로 기록하며 CLI 사용량을
+USD `$0`으로 표현하지 않는다.
+
 ## 예산 초과 처리
 
 - `api-routed`에서 `call_worker.py`가 **Exit Code 2**로 종료되면 즉시 사용자에게 "예산 초과로 중단되었습니다. 예산을 늘려 진행할까요?"라고 질문한다.

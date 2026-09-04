@@ -38,3 +38,19 @@
 분석·계획·`design_spec.md`·`task.md` 작성 시 소스 파일 링크(`[파일명](file:///...)` 또는 라인 범위)와
 지식 위키 경로(`[[wiki/파일명]]`)를 근거로 남긴다.
 아키텍처·폴더 구조 설계·리팩토링 계획·표준 규격 분석에 강하게 적용하며, 사소한 대화에는 적용하지 않는다.
+
+## 오케스트레이터와 전문 워커의 책임 분리 (Separation of Concerns)
+
+- **오케스트레이터 (Orchestrator)**: 순수한 관리자이자 디스패처(Manager & Dispatcher). 태스크 상태 추적, 사용자 승인 중개, 브리프 작성 및 검증, 워커 기동 조율, 완료 지표 집계만 담당한다. 오케스트레이터가 직접 아키텍처를 설계하거나, 마일스톤을 확정하거나, 소스를 수정하는 것은 절대 금지다.
+- **전문 워커 (Specialized Workers)**: 실제 지적 산출물을 전담한다.
+  - `planner`: 요구사항 분석, 마일스톤 기획, 아키텍처 및 트레이드오프 설계 (`design_spec.md`).
+  - `implementer`: 소스 코드 작성 및 리팩토링 (`result.md`).
+  - `critic-standard` / `critic-architecture`: 코드 및 설계의 결함 검증 (`critic_report.md`).
+
+## 실행 주체 투명성 및 귀속 (Actor Attribution)
+
+모든 태스크의 라이프사이클(기획, 명세, 구현, 비평, 검증, 병합)에서 **"누가 그 작업을 수행했는가"**를 명확하고 투명하게 기록한다.
+- **오케스트레이터 표기**: 현재 지휘 중인 관리 CLI(예: `agy-cli`, `codex-cli`, `claude-code`)를 `task.md`의 Meta 및 `log.md`의 각 태그 앞에 `[Actor: <CLI>]` 형태로 고정 표기한다.
+- **워커 및 산출물 주체 표기**: 워커를 호출할 때(`workers_approved`)와 워커가 산출물(`design_spec.md`, `result*.md`, `critic_report*.md`)을 생성할 때, 실행 CLI와 대상 모델(예: `codex-cli (gpt-5.6-sol)`, `claude-code (claude-sonnet-5)`, `agy-cli (gemini-3.5-flash)`)을 상단 헤더 메타데이터에 의무적으로 기록한다.
+- **익명화·생략 금지**: 실행 주체 표기가 누락된 산출물이나 로그는 감사 추적 실패(Audit Failure)로 간주한다.
+

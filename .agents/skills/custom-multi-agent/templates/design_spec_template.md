@@ -1,5 +1,10 @@
 # Design Spec: [설계 명칭]
 
+> **Author**: `[실행 CLI/프로바이더/모델]` (role: `planner`, e.g. `codex-cli / gpt-5.6-sol`)  
+> **Orchestrator**: `[관리 CLI, e.g. agy-cli]`  
+> **Task**: `[태스크명]`  
+> **Date**: `[YYYY-MM-DD HH:MM]`  
+
 ## 1. 아키텍처 & 구조
 * [전체 구조 및 모듈 관계 기술]
 

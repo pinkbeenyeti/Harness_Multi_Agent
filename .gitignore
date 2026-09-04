@@ -19,3 +19,10 @@ custom-multi-agent-skill/
 # IDE files
 *.iml
 
+# Build artifacts (pyproject.toml)
+*.egg-info/
+dist/
+build/
+
+# Test cache
+.pytest_cache/

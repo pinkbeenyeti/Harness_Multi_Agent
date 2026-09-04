@@ -5,6 +5,8 @@
 * **Created**: [YYYY-MM-DD HH:MM]
 * **Updated**: [YYYY-MM-DD HH:MM]
 * **Priority**: normal
+* **Orchestrator**: [CLI명 (예: agy-cli, codex-cli, claude-code)]
+* **Execution Mode**: [cli-routed | api-routed | host-native]
 
 ## Goal
 * [이 작업의 궁극적인 목표를 한 문장으로 기술하십시오.]
@@ -18,9 +20,11 @@
 
 ## Worker Plan
 * **planned_workers**:
-  * [예: codex-main, claude-critic 등]
+  * [예: planner (codex-cli / gpt-5.6-sol), implementer (claude-code / claude-sonnet-5), critic (agy-cli / gemini-3.5-flash)]
 * **workers_approved**:
-  # - worker: 워커명
+  # - worker: 워커 역할 (planner | implementer | critic-standard | critic-architecture)
+  #   cli_or_provider: 실행 CLI 또는 프로바이더 (예: codex-cli, claude-code, agy-cli, anthropic)
+  #   model: 대상 모델명 (예: gpt-5.6-sol, claude-sonnet-5)
   #   approved_at: 승인 시각
   #   purpose: 호출 목적
   #   approved_by: user

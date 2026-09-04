@@ -420,3 +420,147 @@ def check_for_updates():
     except Exception as e:
         print(f"\n⚠️ [Warning] 업데이트를 확인하는 도중 오류가 발생했습니다: {e}")
 
+
+# ---------------------------------------------------------------------------
+# 실행 전 승인 검증 및 이종 교차 비평 인터록 (Approval & Cross-Review Gates)
+# ---------------------------------------------------------------------------
+
+def normalize_actor_name(name):
+    """CLI 또는 프로바이더 명칭을 정규화한다 (예: 'codex-cli' -> 'codex', 'agy-cli' -> 'agy')."""
+    if not name:
+        return ""
+    n = name.lower().strip()
+    if n.endswith("-cli"):
+        n = n[:-4]
+    return n
+
+
+def parse_workers_approved(task_md_path):
+    """
+    task.md의 '* **workers_approved**:' 블록을 파싱하여 승인된 워커 목록을 반환한다.
+    반환: [{'worker': ..., 'cli_or_provider': ..., 'model': ..., ...}, ...]
+    """
+    if not os.path.exists(task_md_path):
+        return []
+    with open(task_md_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    m_block = re.search(r'\*\s*\*\*workers_approved\*\*:(.*?)(?=\n##|\Z)', content, re.DOTALL)
+    if not m_block:
+        return []
+
+    block_text = m_block.group(1)
+    results = []
+    current = {}
+    for line in block_text.splitlines():
+        m_w = re.match(r'^\s*-\s*worker:\s*([^\s#]+)', line)
+        if m_w:
+            if current and "worker" in current:
+                results.append(current)
+            current = {"worker": m_w.group(1).strip()}
+            continue
+        m_c = re.match(r'^\s*cli_or_provider:\s*([^\s#]+)', line)
+        if m_c and current:
+            current["cli_or_provider"] = m_c.group(1).strip()
+            continue
+        m_m = re.match(r'^\s*model:\s*([^\s#]+)', line)
+        if m_m and current:
+            current["model"] = m_m.group(1).strip()
+            continue
+    if current and "worker" in current:
+        results.append(current)
+    return results
+
+
+def get_model_family(name):
+    """모델 또는 CLI/프로바이더 이름으로부터 모델 벤더 가문('openai', 'anthropic', 'google')을 판별한다."""
+    if not name:
+        return "unknown"
+    n = name.lower()
+    if any(k in n for k in ["codex", "openai", "gpt"]):
+        return "openai"
+    if any(k in n for k in ["claude", "anthropic", "sonnet", "haiku", "opus"]):
+        return "anthropic"
+    if any(k in n for k in ["agy", "google", "gemini"]):
+        return "google"
+    return n
+
+
+def verify_worker_approval(task_dir, role, execution_mode, worker_cfg):
+    """
+    task.md의 workers_approved에 기록된 최신 승인 정보와 실제 실행 대상(CLI/provider, model)이
+    일치하는지 검증한다. 불일치 시 에러 문자열을 반환하고, 정상이면 None을 반환한다.
+    """
+    task_md_path = os.path.join(task_dir, "task.md")
+    if not os.path.exists(task_md_path):
+        return None
+
+    approvals = parse_workers_approved(task_md_path)
+    role_approvals = [a for a in approvals if a.get("worker") == role]
+    if not role_approvals:
+        return f"역할 '{role}'에 대한 사용자 승인(workers_approved) 내역이 task.md에 없습니다."
+
+    latest = role_approvals[-1]
+    approved_cli_or_prov = normalize_actor_name(latest.get("cli_or_provider", ""))
+    approved_model = latest.get("model", "").strip().lower()
+
+    if execution_mode == "cli-routed":
+        actual_cli_or_prov = normalize_actor_name(worker_cfg.get("cli", ""))
+    elif execution_mode == "api-routed":
+        actual_cli_or_prov = normalize_actor_name(worker_cfg.get("provider", ""))
+    else:
+        actual_cli_or_prov = "host-native"
+    actual_model = worker_cfg.get("model", "").strip().lower()
+
+    if approved_cli_or_prov and actual_cli_or_prov != approved_cli_or_prov:
+        return (f"실행 CLI/프로바이더('{actual_cli_or_prov}')가 "
+                f"task.md 승인 내역('{approved_cli_or_prov}')과 불일치합니다.")
+
+    if approved_model and actual_model != approved_model:
+        return (f"실행 대상 모델('{actual_model}')이 "
+                f"task.md 승인 내역('{approved_model}')과 불일치합니다.")
+
+    return None
+
+
+def verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg):
+    """
+    비평 역할('critic-*') 기동 시, 직전 구현자(implementer)와 동일한 모델 계열(OpenAI/Anthropic/Google)의
+    비평 모델이 사용되지 않도록 이종 교차 비평(Cross-Review) 원칙을 강제한다.
+    """
+    if not role.startswith("critic"):
+        return None
+
+    critic_actor = worker_cfg.get("cli") if execution_mode == "cli-routed" else worker_cfg.get("provider", "")
+    critic_model = worker_cfg.get("model", "")
+    critic_family = get_model_family(critic_actor) or get_model_family(critic_model)
+
+    implementer_family = None
+    cost_tracker_path = os.path.join(task_dir, "cost_tracker.json")
+    if os.path.exists(cost_tracker_path):
+        try:
+            with open(cost_tracker_path, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+            for item in reversed(cdata.get("cli_quota", {}).get("history", [])):
+                if item.get("role") == "implementer" and item.get("exit_code") == 0:
+                    implementer_family = get_model_family(item.get("cli")) or get_model_family(item.get("model"))
+                    break
+        except Exception:
+            pass
+
+    if not implementer_family:
+        task_md_path = os.path.join(task_dir, "task.md")
+        approvals = parse_workers_approved(task_md_path)
+        for a in reversed(approvals):
+            if a.get("worker") == "implementer":
+                implementer_family = get_model_family(a.get("cli_or_provider")) or get_model_family(a.get("model"))
+                break
+
+    if implementer_family and critic_family == implementer_family:
+        return (f"동종 모델 교차 비평 차단: 직전 구현자 계열({implementer_family})과 "
+                f"현재 비평자 계열({critic_family})이 동일합니다. 이종 모델 교차 비평(Cross-Review) 원칙에 따라 "
+                f"기동이 차단됩니다. (예: Codex/OpenAI 코딩은 Gemini/Google 또는 Claude/Anthropic이 비평해야 함)")
+
+    return None
+
+

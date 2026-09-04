@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "_comment": "limit_tokens가 주 통제 수단이다. 언어와 무관한 단일 예산이라 한글 브리프든 영어 브리프든 같은 기준으로 걸린다(예전 limit_korean/limit_english AND 방식은 영어로 쓴 문서를 항상 탈락시켰다). exclude_code_blocks가 true면 코드펜스 바깥(산문)만 센다. limit_bytes는 코드를 포함한 전체 크기 상한으로, 전체 파일 재출력 대신 diff/앵커 패치를 쓰도록 강제한다.",
   "_calibration": "실측 기반. 브리프 13건: 최소 1246 / 중앙 1642 / 최대 2585 → 상한 1800(부풀어오른 워커 브리프만 걸리고 잘 쓰인 크리틱 브리프는 통과). result/critic 산문 토큰은 변경 후 태스크(1417~3652)와 변경 전 태스크(7163~12138) 사이에 뚜렷한 간극이 있어, 그 사이에 상한을 두어 현행 정상 동작은 허용하고 구 방식으로의 회귀만 차단한다.",
   "rules": {
@@ -6,17 +7,26 @@
       "limit_tokens": 1800
     },
     "brief.md": {
-      "limit_tokens": 1800
+      "limit_tokens": 1800,
+      "required_fields": ["paths", "line_ranges", "in_scope", "out_of_scope", "performance"]
+    },
+    "brief_recritic.md": {
+      "limit_tokens": 800,
+      "required_fields": ["previous_findings", "changed_hunks", "related_lines"]
     },
     "result.md": {
       "exclude_code_blocks": true,
-      "limit_tokens": 2500,
-      "limit_bytes": 15000
+      "limit_tokens": 1200,
+      "limit_bytes": 15000,
+      "patch_only": true,
+      "allow_full_content_for_new_files": true
     },
     "critic_report.md": {
       "exclude_code_blocks": true,
-      "limit_tokens": 4000,
-      "limit_bytes": 12000
+      "limit_tokens": 1600,
+      "limit_bytes": 8000,
+      "require_verdict": true
     }
   }
 }
+

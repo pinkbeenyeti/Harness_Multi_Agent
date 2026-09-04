@@ -1,0 +1,24 @@
+[project]
+name = "harness-multi-agent"
+version = "0.1.0"
+description = "파일 기반 오케스트레이터-워커 멀티에이전트 개발 스킬"
+requires-python = ">=3.11"
+license = "MIT"
+
+# 코어 스크립트는 표준 라이브러리만 사용한다.
+# google-antigravity는 host-native 모드 전용 선택 의존성이다.
+dependencies = []
+
+[project.optional-dependencies]
+# host-native 모드(Antigravity SDK 서브에이전트 직접 기동)에 필요
+sdk = ["google-antigravity>=0.1.5"]
+# 개발·테스트 환경
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
