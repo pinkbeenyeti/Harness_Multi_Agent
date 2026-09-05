@@ -76,10 +76,17 @@ CLI/provider·model·effort, 예산, PASS 후 자동 병합 여부와 예외 중
 - `BUDGET_EXHAUSTED`: 승인된 비용·호출 예산 소진
 
 그룹 상태는
-`IMPLEMENT_1 → CRITIC_1 → (PASS: READY_TO_MERGE, FAIL: IMPLEMENT_2
+`(선택: PLAN → PLAN_CRITIQUE) → IMPLEMENT_1 → CRITIC_1 → (PASS: READY_TO_MERGE, FAIL: IMPLEMENT_2
 → CRITIC_2 → PASS/ESCALATED)`로 제한한다. 실패·절단된 프로세스도 해당
 슬롯을 소비하며 같은 슬롯을 재시도하지 않는다. 첫 시도 실패는 두 번째
 구현으로 진행하고 두 번째 시도 실패는 에스컬레이션한다.
+
+계획 자체(설계가 요구사항을 빠짐없이 반영했는지)를 구현 착수 전에 검증하려면,
+`call_worker.py`를 `--stage plan_critique`로 호출한다(예:
+`python scripts/call_worker.py critic-architecture <brief> <result> --stage plan_critique`).
+planner 이후·첫 IMPLEMENT_1 이전에 단 1회만 허용되며, 생략하고 곧장
+IMPLEMENT_1로 넘어가도 된다(선택 단계). 이때 이종 교차 비평 원칙은
+implementer가 아닌 **planner**의 모델 계열을 기준으로 검사된다.
 
 첫 critic FAIL 시 `brief_recritic_<group>.md`에 이전 finding, 변경 hunk,
 관련 라인만 기록한다. 구현과 critic은 그룹별 최대 2회이며 모든 그룹이

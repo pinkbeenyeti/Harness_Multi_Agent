@@ -26,6 +26,7 @@ from common_utils import (
     TOKENS_PER_HANGUL_CHAR,
     TOKENS_PER_ASCII_CHAR,
     archive_stale_log_entries,
+    parse_workers_approved,
 )
 
 FENCE_RE = re.compile(r'^\s*```')
@@ -263,7 +264,7 @@ def analyze_worker_runs(cost_data):
 def pipeline_violations(runs):
     errors, groups = [], {}
     for run in runs:
-        if run.get("stage") != "plan" and run.get("outcome") != "running":
+        if run.get("stage") not in ("plan", "plan_critique") and run.get("outcome") != "running":
             groups.setdefault(run.get("group", "default"), []).append(run)
     for group, items in groups.items():
         expected = ("implement", 1)
@@ -323,8 +324,69 @@ def check_brief_limits(task_dir):
     return offenders
 
 
+def check_worker_coverage(task_dir, cost_data):
+    """task.md의 workers_approved에는 있으나 cost_tracker.json 어디에도
+    성공 호출 기록이 없는 역할을 적발한다. verify_worker_approval()은 '지금 이
+    호출이 승인됐는가'만 검사하는 편도 체크라서, 승인만 받고 끝내 한 번도
+    부르지 않은 워커(예: 계획비평용 critic-standard)를 잡아내지 못한다
+    (2026-09 audio-infrastructure 태스크 실측: critic-standard가 승인됐지만
+    cli_quota.history/worker_runs 어디에도 등장하지 않았다).
+
+    같은 역할이 서로 다른 stage(plan_critique/critic)로 각각 승인된 경우, 승인
+    항목에 stage가 있으면 (role, stage) 단위로 커버리지를 추적한다 — 그래야
+    "critic-architecture가 구조비평은 했지만 계획비평은 건너뛴" 것처럼 같은
+    역할이 한쪽 stage만 실행된 경우도 잡아낸다. stage가 없는(레거시) 승인
+    항목은 기존처럼 role 단위(어느 stage든 한 번이라도 실행되면 충족)로 취급한다."""
+    approvals = parse_workers_approved(os.path.join(task_dir, "task.md"))
+    if not approvals:
+        return [], []
+
+    latest_by_key = {}
+    for a in approvals:
+        role = a.get("worker")
+        if not role:
+            continue
+        key = (role, a["stage"]) if a.get("stage") else role
+        latest_by_key[key] = a  # 뒤에 나온 승인이 최신본
+
+    executed_pairs = set()  # {(role, stage_or_None), ...}
+    for item in cost_data.get("cli_quota", {}).get("history", []) or []:
+        if item.get("exit_code") == 0 and item.get("role"):
+            executed_pairs.add((item["role"], item.get("stage")))
+    for item in cost_data.get("usd_cost", {}).get("history", []) or []:
+        if item.get("role"):
+            executed_pairs.add((item["role"], item.get("stage")))
+    for item in cost_data.get("worker_runs", []) or []:
+        if item.get("outcome") == "success" and item.get("role"):
+            executed_pairs.add((item["role"], item.get("stage")))
+    executed_roles_any_stage = {r for r, _ in executed_pairs}
+
+    never_called = []
+    for key in latest_by_key:
+        if isinstance(key, tuple):
+            covered = key in executed_pairs
+        else:
+            covered = key in executed_roles_any_stage
+        if not covered:
+            never_called.append(key)
+    never_called.sort(key=lambda k: k if isinstance(k, tuple) else (k, ""))
+
+    violations = []
+    for key in never_called:
+        a = latest_by_key[key]
+        role, stage = key if isinstance(key, tuple) else (key, None)
+        stage_desc = f"(stage={stage}) " if stage else ""
+        violations.append(
+            f"APPROVED_WORKER_NOT_CALLED: 승인된 워커 '{role}' {stage_desc}"
+            f"({a.get('cli_or_provider', '?')}/{a.get('model', '?')})가 "
+            f"승인({a.get('approved_at', '?')}) 이후 한 번도 성공 호출되지 않았습니다. "
+            "승인만 받고 실행을 누락한 것인지, 더는 필요 없어 취소된 것인지 확인하십시오.")
+    never_called_roles = sorted({(k[0] if isinstance(k, tuple) else k) for k in never_called})
+    return violations, never_called_roles
+
+
 def check_compliance(tags, groups=1, brief_violations=None, brief_tok=0,
-                     worker_tok=0, worker_runs=None):
+                     worker_tok=0, worker_runs=None, task_dir=None, cost_data=None):
     """
     groups: 병렬 실행 그룹 수(= result*.md 개수). 워커를 파일 그룹별로 병렬
     기동하면 그룹 수만큼 호출이 늘어나는 것이 정상이므로, 교정 루프 상한도
@@ -371,6 +433,11 @@ def check_compliance(tags, groups=1, brief_violations=None, brief_tok=0,
             f"BRIEF_OVER_LIMIT: 브리프 {len(brief_violations)}건이 분량 상한을 초과했습니다 — {head}{more}. "
             "브리프는 경로·라인 범위·지시만 담습니다.")
 
+    never_called = []
+    if task_dir is not None and cost_data is not None:
+        coverage_violations, never_called = check_worker_coverage(task_dir, cost_data)
+        violations.extend(coverage_violations)
+
     return {
         "ok": not violations,
         "violations": violations,
@@ -381,6 +448,8 @@ def check_compliance(tags, groups=1, brief_violations=None, brief_tok=0,
         "correction_loop_exceeded": legacy_exceeded or bool(state_errors),
         "brief_over_limit": bool(brief_violations),
         "brief_result_ratio_exceeded": worker_tok > 0 and brief_tok / worker_tok > 2.0,
+        "approved_worker_not_called": bool(never_called),
+        "approved_workers_never_called": never_called,
     }
 
 
@@ -480,7 +549,8 @@ def build_metrics(base_dir, task_name):
         "compliance": check_compliance(tags, groups=parallel_groups,
                                        brief_violations=check_brief_limits(task_dir),
                                        brief_tok=brief_tok, worker_tok=worker_tok,
-                                       worker_runs=run_stats["runs"]),
+                                       worker_runs=run_stats["runs"],
+                                       task_dir=task_dir, cost_data=cost_data),
         "fixed_overhead": overhead,
         "artifacts": {k: {"bytes": v["bytes"], "total_tokens": v["total_tokens"],
                           "code_tokens": v["code_tokens"], "prose_tokens": v["prose_tokens"],

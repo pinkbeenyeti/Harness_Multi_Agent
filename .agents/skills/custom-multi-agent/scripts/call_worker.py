@@ -52,7 +52,7 @@ def parse_args(argv):
     p.add_argument("brief")
     p.add_argument("result")
     p.add_argument("legacy_effort", nargs="?")
-    p.add_argument("--stage", choices=("plan", "implement", "critic"))
+    p.add_argument("--stage", choices=("plan", "plan_critique", "implement", "critic"))
     p.add_argument("--group", default="default")
     p.add_argument("--attempt", type=int, choices=(1, 2), default=1)
     p.add_argument("--model")
@@ -91,7 +91,7 @@ def scan_pipeline_attempts(task_dir, group):
     if not os.path.exists(path):
         return []
     pattern = re.compile(
-        r"\[WORKER_ATTEMPT\].*?\bgroup=(\S+).*?\bstage=(plan|implement|critic)"
+        r"\[WORKER_ATTEMPT\].*?\bgroup=(\S+).*?\bstage=(plan|plan_critique|implement|critic)"
         r".*?\battempt=([12]).*?\boutcome=(\w+)(?:.*?\bverdict=(PASS|FAIL))?")
     runs = []
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -103,23 +103,35 @@ def scan_pipeline_attempts(task_dir, group):
                     "verdict": m.group(5), "legacy": True})
     return runs
 
-def expected_transition(runs):
+def expected_transitions(runs):
+    """이 시점에서 합법적인 (stage, attempt) 목록을 반환한다. plan_critique는
+    선택 단계라 같은 시점에 두 개의 합법적인 다음 수(계획 비평을 거치거나 곧장
+    구현으로 넘어가거나)가 동시에 존재할 수 있어, 단일 expected 값이 아니라
+    허용 목록으로 표현한다."""
     ended = [r for r in runs if r.get("outcome") != "running"]
     plans = [r for r in ended if r.get("stage") == "plan"]
     if len(plans) > 1:
         raise PipelineViolation("planner may run at most once")
-    work = [r for r in ended if r.get("stage") != "plan"]
+    plan_crits = [r for r in ended if r.get("stage") == "plan_critique"]
+    if len(plan_crits) > 1:
+        raise PipelineViolation("plan_critique may run at most once")
+    if plan_crits and not plans:
+        raise PipelineViolation("plan_critique requires a prior plan")
+
+    work = [r for r in ended if r.get("stage") not in ("plan", "plan_critique")]
     if not work:
-        return ("implement", 1)
+        if plans and not plan_crits:
+            return [("plan_critique", 1), ("implement", 1)]
+        return [("implement", 1)]
     last = work[-1]
     stage, attempt = last.get("stage"), int(last.get("attempt", 1))
     if last.get("outcome") != "success":
-        return ("implement", 2) if attempt == 1 else None
+        return [("implement", 2)] if attempt == 1 else []
     if stage == "implement":
-        return ("critic", attempt)
+        return [("critic", attempt)]
     if last.get("verdict") == "PASS":
-        return None
-    return ("implement", 2) if attempt == 1 else None
+        return []
+    return [("implement", 2)] if attempt == 1 else []
 
 def reserve_pipeline_slot(tracker_path, key, stage, attempt, run_id):
     legacy = scan_pipeline_attempts(os.path.dirname(tracker_path), key.group)
@@ -127,12 +139,12 @@ def reserve_pipeline_slot(tracker_path, key, stage, attempt, run_id):
         stored = data.get("worker_runs")
         runs = stored if isinstance(stored, list) else legacy
         group_runs = [r for r in runs if r.get("group", "default") == key.group]
-        expected = expected_transition(group_runs)
+        allowed = expected_transitions(group_runs)
         if stage == "plan":
             if any(r.get("stage") == "plan" for r in group_runs):
                 raise PipelineViolation("planner already consumed")
-        elif expected != (stage, attempt):
-            raise PipelineViolation(f"expected {expected}, got {(stage, attempt)}")
+        elif (stage, attempt) not in allowed:
+            raise PipelineViolation(f"expected one of {allowed}, got {(stage, attempt)}")
         if not isinstance(stored, list):
             data["worker_runs"] = list(legacy)
         data["worker_runs"].append({
@@ -604,7 +616,7 @@ def main():
             cli_allowlist = _read_json(os.path.join(base_dir, "backends.json")).get("cli_allowlist", {})
 
     # 1.2 승인 일치 검증 게이트 (Approval Enforcement)
-    approval_err = verify_worker_approval(task_dir, role, execution_mode, worker_cfg)
+    approval_err = verify_worker_approval(task_dir, role, execution_mode, worker_cfg, stage=args.stage)
     if approval_err:
         print(f"\n[APPROVAL VIOLATION] {approval_err}")
         print("  → task.md의 workers_approved 승인 내역과 실제 실행 대상이 일치하지 않습니다.")
@@ -615,7 +627,7 @@ def main():
         sys.exit(EXIT_APPROVAL_VIOLATION)
 
     # 1.3 이종 모델 교차 비평 인터록 (Cross-Review Interlock)
-    cross_err = verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg)
+    cross_err = verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg, stage=args.stage)
     if cross_err:
         print(f"\n[CROSS-REVIEW VIOLATION] {cross_err}")
         print("  → 비평 워커는 직전 구현자와 동일한 모델 계열(Vendor)일 수 없습니다.")
@@ -626,7 +638,7 @@ def main():
         sys.exit(EXIT_CROSS_REVIEW_VIOLATION)
 
     if isinstance(scope, dict):
-        route_key = "critic" if args.stage == "critic" else role
+        route_key = "critic" if args.stage in ("critic", "plan_critique") else role
         approved = scope.get("routes", {}).get(route_key, {})
         actual_route = worker_cfg.get("cli", provider)
         invalid = (
@@ -810,7 +822,7 @@ def main():
     finish_pipeline_slot(
         cost_tracker_path, run_id, role=role, model=model, effort=effort,
         outcome="success",
-        verdict=critic_verdict(result_text) if args.stage == "critic" else None,
+        verdict=critic_verdict(result_text) if args.stage in ("critic", "plan_critique") else None,
         execution_wallclock_sec=round(time.monotonic()-started_mono, 3))
 
     # 리뷰 진행 중으로 상태 업데이트
@@ -831,7 +843,7 @@ def main():
         if execution_mode == "cli-routed":
             cq = d.setdefault("cli_quota", {"history": []})
             cq["history"].append({"timestamp": _now(), "cli": worker_cfg.get("cli"),
-                "role": role, "model": model, "exit_code": exit_code})
+                "role": role, "model": model, "exit_code": exit_code, "stage": args.stage})
         elif execution_mode == "api-routed":
             cost = _calc_cost(worker_cfg, input_tokens, output_tokens)
             uc = d.setdefault("usd_cost", {"accumulated": 0.0, "reserved": 0.0, "history": []})

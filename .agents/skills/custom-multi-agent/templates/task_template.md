@@ -23,6 +23,10 @@
   * [예: planner (codex-cli / gpt-5.6-sol), implementer (claude-code / claude-sonnet-5), critic (agy-cli / gemini-3.5-flash)]
 * **workers_approved**:
   # - worker: 워커 역할 (planner | implementer | critic-standard | critic-architecture)
+  #   stage: [선택] 이 승인이 적용되는 call_worker.py --stage (plan | plan_critique | implement | critic).
+  #     같은 역할이 서로 다른 stage로 각각 승인될 때만 명시한다(예: critic-architecture가
+  #     plan_critique와 critic 양쪽에 다르게 승인된 경우). 생략하면 해당 역할의 모든 stage에
+  #     공통 적용되는 기존 방식대로 동작한다.
   #   cli_or_provider: 실행 CLI 또는 프로바이더 (예: codex-cli, claude-code, agy-cli, anthropic)
   #   model: 대상 모델명 (예: gpt-5.6-sol, claude-sonnet-5)
   #   approved_at: 승인 시각

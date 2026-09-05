@@ -467,6 +467,18 @@ def parse_workers_approved(task_md_path):
         if m_m and current:
             current["model"] = m_m.group(1).strip()
             continue
+        m_e = re.match(r'^\s*effort:\s*([^\s#]+)', line)
+        if m_e and current:
+            current["effort"] = m_e.group(1).strip()
+            continue
+        m_s = re.match(r'^\s*stage:\s*([^\s#]+)', line)
+        if m_s and current:
+            current["stage"] = m_s.group(1).strip()
+            continue
+        m_at = re.match(r'^\s*approved_at:\s*(.+?)\s*$', line)
+        if m_at and current:
+            current["approved_at"] = m_at.group(1).strip()
+            continue
     if current and "worker" in current:
         results.append(current)
     return results
@@ -486,10 +498,15 @@ def get_model_family(name):
     return n
 
 
-def verify_worker_approval(task_dir, role, execution_mode, worker_cfg):
+def verify_worker_approval(task_dir, role, execution_mode, worker_cfg, stage=None):
     """
     task.md의 workers_approved에 기록된 최신 승인 정보와 실제 실행 대상(CLI/provider, model)이
     일치하는지 검증한다. 불일치 시 에러 문자열을 반환하고, 정상이면 None을 반환한다.
+
+    같은 역할(예: critic-architecture)이 서로 다른 stage(plan_critique/critic)에
+    각각 다르게 승인될 수 있어, 승인 항목에 stage가 명시된 경우 요청 stage와
+    일치하는 항목만 후보로 삼는다. stage가 전혀 명시되지 않은(레거시) 승인 항목은
+    모든 stage에 대해 유효한 것으로 취급해 기존 task.md와 호환된다.
     """
     task_md_path = os.path.join(task_dir, "task.md")
     if not os.path.exists(task_md_path):
@@ -499,6 +516,14 @@ def verify_worker_approval(task_dir, role, execution_mode, worker_cfg):
     role_approvals = [a for a in approvals if a.get("worker") == role]
     if not role_approvals:
         return f"역할 '{role}'에 대한 사용자 승인(workers_approved) 내역이 task.md에 없습니다."
+
+    tagged = [a for a in role_approvals if a.get("stage")]
+    if stage and tagged:
+        matching = [a for a in tagged if a.get("stage") == stage]
+        if not matching:
+            return (f"역할 '{role}'의 stage '{stage}'에 대한 승인(workers_approved)이 "
+                     "task.md에 없습니다(다른 stage로만 승인됨).")
+        role_approvals = matching
 
     latest = role_approvals[-1]
     approved_cli_or_prov = normalize_actor_name(latest.get("cli_or_provider", ""))
@@ -523,41 +548,46 @@ def verify_worker_approval(task_dir, role, execution_mode, worker_cfg):
     return None
 
 
-def verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg):
+def verify_cross_review_integrity(task_dir, role, execution_mode, worker_cfg, stage=None):
     """
-    비평 역할('critic-*') 기동 시, 직전 구현자(implementer)와 동일한 모델 계열(OpenAI/Anthropic/Google)의
+    비평 역할('critic-*') 기동 시, 비평 대상과 동일한 모델 계열(OpenAI/Anthropic/Google)의
     비평 모델이 사용되지 않도록 이종 교차 비평(Cross-Review) 원칙을 강제한다.
+    stage='plan_critique'(계획 비평)면 planner를, 그 외(구조 비평)는 implementer를
+    비평 대상으로 삼는다 — 계획 비평 시점엔 implementer가 아직 실행 전이라 그 벤더와
+    비교하는 것은 의미가 없다.
     """
     if not role.startswith("critic"):
         return None
+
+    target_role = "planner" if stage == "plan_critique" else "implementer"
 
     critic_actor = worker_cfg.get("cli") if execution_mode == "cli-routed" else worker_cfg.get("provider", "")
     critic_model = worker_cfg.get("model", "")
     critic_family = get_model_family(critic_actor) or get_model_family(critic_model)
 
-    implementer_family = None
+    target_family = None
     cost_tracker_path = os.path.join(task_dir, "cost_tracker.json")
     if os.path.exists(cost_tracker_path):
         try:
             with open(cost_tracker_path, "r", encoding="utf-8") as f:
                 cdata = json.load(f)
             for item in reversed(cdata.get("cli_quota", {}).get("history", [])):
-                if item.get("role") == "implementer" and item.get("exit_code") == 0:
-                    implementer_family = get_model_family(item.get("cli")) or get_model_family(item.get("model"))
+                if item.get("role") == target_role and item.get("exit_code") == 0:
+                    target_family = get_model_family(item.get("cli")) or get_model_family(item.get("model"))
                     break
         except Exception:
             pass
 
-    if not implementer_family:
+    if not target_family:
         task_md_path = os.path.join(task_dir, "task.md")
         approvals = parse_workers_approved(task_md_path)
         for a in reversed(approvals):
-            if a.get("worker") == "implementer":
-                implementer_family = get_model_family(a.get("cli_or_provider")) or get_model_family(a.get("model"))
+            if a.get("worker") == target_role:
+                target_family = get_model_family(a.get("cli_or_provider")) or get_model_family(a.get("model"))
                 break
 
-    if implementer_family and critic_family == implementer_family:
-        return (f"동종 모델 교차 비평 차단: 직전 구현자 계열({implementer_family})과 "
+    if target_family and critic_family == target_family:
+        return (f"동종 모델 교차 비평 차단: 직전 '{target_role}' 계열({target_family})과 "
                 f"현재 비평자 계열({critic_family})이 동일합니다. 이종 모델 교차 비평(Cross-Review) 원칙에 따라 "
                 f"기동이 차단됩니다. (예: Codex/OpenAI 코딩은 Gemini/Google 또는 Claude/Anthropic이 비평해야 함)")
 
