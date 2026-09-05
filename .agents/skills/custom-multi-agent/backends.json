@@ -59,9 +59,9 @@
     },
     "agy": {
       "binary": "agy",
-      "args": ["--sandbox", "--dangerously-skip-permissions", "--output-format", "json"],
+      "args": ["--sandbox", "--dangerously-skip-permissions", "--mode", "plan", "--output-format", "json"],
       "model_arg": ["--model", "{model}"],
-      "effort_args": {"low": ["--mode", "fast"], "medium": ["--mode", "plan"], "high": ["--mode", "plan"]},
+      "effort_args": {"low": [], "medium": [], "high": []},
       "allowed_efforts": ["low", "medium", "high"]
     }
   }
