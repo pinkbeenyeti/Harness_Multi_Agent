@@ -730,6 +730,10 @@ def main():
             args.stage, args.attempt, run_id)
     except PipelineViolation as exc:
         print(f"[PIPELINE VIOLATION] {exc}")
+        log_path_pre = os.path.join(task_dir, "log.md")
+        if os.path.exists(log_path_pre):
+            with open(log_path_pre, "a", encoding="utf-8") as lf:
+                lf.write(f"\n{_now()} [ERROR] 파이프라인 순서 위반으로 워커 기동 차단: {exc}")
         sys.exit(EXIT_CORRECTION_LIMIT)
 
     try:
