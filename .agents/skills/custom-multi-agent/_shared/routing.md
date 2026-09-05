@@ -39,7 +39,7 @@ Tier 2는 위험도에 따라 **일반**과 **고위험**으로 다시 나뉜다
 
   | 역할 | 모델 | effort |
   |---|---|---|
-  | `planner` | GPT-5.6 Sol | medium |
+  | `planner` | Claude Opus 5 | medium |
   | `implementer` | Claude Sonnet 5 | medium |
   | `critic-architecture` | Gemini 3.1 Pro | medium |
 
@@ -47,7 +47,7 @@ Tier 2는 위험도에 따라 **일반**과 **고위험**으로 다시 나뉜다
 
   | 역할 | 모델 | effort |
   |---|---|---|
-  | `planner` | GPT-5.6 Sol | high |
+  | `planner` | Claude Opus 5 | high |
   | `critic-standard` (계획비평) | Gemini Flash | medium |
   | `implementer` | Claude Sonnet 5 | medium |
   | `critic-architecture` (구조비평) | Gemini 3.1 Pro | medium |
@@ -68,7 +68,7 @@ Tier 2는 위험도에 따라 **일반**과 **고위험**으로 다시 나뉜다
 |---|---|---|---|---|
 | 0 | — | — | — | — |
 | 1 | — | Sonnet5 (medium) | Gemini Flash (medium) | — |
-| 2 일반 | Sol (medium) | Sonnet5 (medium) | — | Gemini 3.1 Pro (medium) |
-| 2 고위험 | Sol (high) | Sonnet5 (medium) | Gemini Flash (medium, 계획비평) | Gemini 3.1 Pro (medium) |
+| 2 일반 | Opus5 (medium) | Sonnet5 (medium) | — | Gemini 3.1 Pro (medium) |
+| 2 고위험 | Opus5 (high) | Sonnet5 (medium) | Gemini Flash (medium, 계획비평) | Gemini 3.1 Pro (medium) |
 
 `execution_mode`가 `host-native`이면 위 모델 지정 대신 오케스트레이터가 Agent 도구로 별도 서브에이전트를 기동하고 구독 쿼터를 소비한다(USD $0이 아니다 — `cli_quota`/쿼터 소모로 별도 기록). `cost_tracker.json` 자동 계측이 `api-routed`처럼 동작하지 않으므로 완료 시 `collect_metrics.py`를 반드시 실행한다. 상세는 `_shared/antigravity_guide.md` 참조.
